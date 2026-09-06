@@ -3,28 +3,19 @@
  *
  * TLS 1.3 only. Single ciphersuite: TLS_CHACHA20_POLY1305_SHA256.
  * Single key-exchange group: X25519.
- * NO certificate validation whatsoever (--insecure semantics, permanently).
- * We don't even parse the certificate: we skip Certificate / CertificateVerify
- * as opaque blobs, only feeding their raw bytes into the transcript hash,
- * because the handshake's key schedule and Finished MAC depend on that hash
- * even though we never check the signature it "proves".
+ * NO certificate validation (unless nanocurl-verify helper is used)
  *
- * This is a teaching skeleton, not a library. It will break on:
- *  - servers that don't offer TLS_CHACHA20_POLY1305_SHA256 + x25519
- *  - HelloRetryRequest (server rejects our key_share group) - unhandled
- *  - handshake messages split weirdly across TCP segments in ways the
- *    (deliberately simplistic) reassembly logic doesn't expect
- *  - anything requiring ALPN/h2 fallback (we only ever ask for http/1.1
- *    implicitly by not sending ALPN at all -- most servers still allow
- *    plain HTTP/1.1 on the wire when ALPN is absent, but not universally)
+ * This *will* break when:
+ * - server don't offer TLS_CHACHA20_POLY1305_SHA256 + x25519
+ * - we receive HelloRetryRequest (server rejects our key_share group)
+ * - handshake messages split weirdly across TCP segments in ways the
+ *   (deliberately simplistic) reassembly logic doesn't expect
+ * - talking to an http2-only server
  *
- * Build:  gcc -O2 -o nanocurl nanocurl.c
- * Run:    ./nanocurl example.com /
+ * Build: gcc -O2 -o nanocurl nanocurl.c
+ * Run:   ./nanocurl example.com/test
  *
- * A security expert reading this should be rolling their eyes. That is
- * intentional and the whole point of the exercise.
  */
-
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,383 +25,30 @@
 #include <strings.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <errno.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 
-typedef uint8_t  u8;
+typedef uint8_t u8;
 typedef uint32_t u32;
 typedef uint64_t u64;
 
 /* TLS 1.3 max ciphertext record size: 2^14 (16384) plaintext bytes, +1 content-type
    byte, + up to 255 bytes of padding, + 16-byte AEAD tag = 16640. Every buffer that
-   might hold a full record (ciphertext, plaintext, or the AAD+ciphertext+padding+
-   length scratch space used for the Poly1305 MAC) needs to be at least this big --
-   getting this wrong is exactly what caused the stack buffer overflow this constant
-   now prevents. A little headroom on top costs nothing.  */
+   might hold a full record (AAD+ciphertext+padding+length scratch space used for
+   the Poly1305 MAC) needs to be at least this big. */
 #define TLS_MAX_RECORD 16640
 #define BUFSZ (TLS_MAX_RECORD + 128)
 
-/* ======================================================================
- * SHA-256 (textbook FIPS 180-4)
- * ==================================================================== */
-
-typedef struct { u32 s[8]; u8 buf[64]; u64 len; } sha256_ctx;
-
-static const u32 SHA256_K[64] = {
-0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
-
-#define ROTR(x,n) (((x)>>(n))|((x)<<(32-(n))))
-static void sha256_block(sha256_ctx *c, const u8 *p) {
-    u32 w[64], a,b,cc,d,e,f,g,h,i,t1,t2;
-    for (i=0;i<16;i++) w[i]=((u32)p[4*i]<<24)|((u32)p[4*i+1]<<16)|((u32)p[4*i+2]<<8)|(u32)p[4*i+3];
-    for (;i<64;i++) {
-        u32 s0 = ROTR(w[i-15],7)^ROTR(w[i-15],18)^(w[i-15]>>3);
-        u32 s1 = ROTR(w[i-2],17)^ROTR(w[i-2],19)^(w[i-2]>>10);
-        w[i] = w[i-16]+s0+w[i-7]+s1;
-    }
-    a=c->s[0];b=c->s[1];cc=c->s[2];d=c->s[3];e=c->s[4];f=c->s[5];g=c->s[6];h=c->s[7];
-    for (i=0;i<64;i++) {
-        u32 S1 = ROTR(e,6)^ROTR(e,11)^ROTR(e,25);
-        u32 ch = (e&f)^((~e)&g);
-        t1 = h+S1+ch+SHA256_K[i]+w[i];
-        u32 S0 = ROTR(a,2)^ROTR(a,13)^ROTR(a,22);
-        u32 maj = (a&b)^(a&cc)^(b&cc);
-        t2 = S0+maj;
-        h=g; g=f; f=e; e=d+t1; d=cc; cc=b; b=a; a=t1+t2;
-    }
-    c->s[0]+=a;c->s[1]+=b;c->s[2]+=cc;c->s[3]+=d;c->s[4]+=e;c->s[5]+=f;c->s[6]+=g;c->s[7]+=h;
-}
-static void sha256_init(sha256_ctx *c) {
-    static const u32 iv[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
-                               0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
-    memcpy(c->s, iv, sizeof iv); c->len = 0;
-}
-static void sha256_update(sha256_ctx *c, const u8 *data, size_t n) {
-    size_t off = c->len % 64;
-    c->len += n;
-    while (n) {
-        size_t take = 64-off < n ? 64-off : n;
-        memcpy(c->buf+off, data, take);
-        off += take; data += take; n -= take;
-        if (off == 64) { sha256_block(c, c->buf); off = 0; }
-    }
-}
-/* finalize a *copy* so the running context stays usable (needed for transcript snapshots) */
-static void sha256_final_copy(sha256_ctx c, u8 out[32]) {
-    u64 bitlen = c.len*8;
-    u8 pad = 0x80;
-    sha256_update(&c, &pad, 1);
-    u8 z = 0;
-    while (c.len % 64 != 56) sha256_update(&c, &z, 1);
-    u8 lenbytes[8];
-    for (int i=0;i<8;i++) lenbytes[i] = (u8)(bitlen >> (56-8*i));
-    sha256_update(&c, lenbytes, 8);
-    for (int i=0;i<8;i++) {
-        out[4*i]=c.s[i]>>24; out[4*i+1]=c.s[i]>>16; out[4*i+2]=c.s[i]>>8; out[4*i+3]=c.s[i];
-    }
-}
-static void sha256(const u8 *data, size_t n, u8 out[32]) {
-    sha256_ctx c; sha256_init(&c); sha256_update(&c, data, n); sha256_final_copy(c, out);
-}
-
-/* ======================================================================
- * HMAC-SHA256 / HKDF / TLS1.3 Expand-Label
- * ==================================================================== */
-
-static void hmac_sha256(const u8 *key, size_t klen, const u8 *msg, size_t mlen, u8 out[32]) {
-    u8 k[64] = {0};
-    if (klen > 64) sha256(key, klen, k); else memcpy(k, key, klen);
-    u8 ipad[64], opad[64];
-    for (int i=0;i<64;i++) { ipad[i]=k[i]^0x36; opad[i]=k[i]^0x5c; }
-    sha256_ctx c; sha256_init(&c);
-    sha256_update(&c, ipad, 64);
-    sha256_update(&c, msg, mlen);
-    u8 inner[32]; sha256_final_copy(c, inner);
-    sha256_init(&c);
-    sha256_update(&c, opad, 64);
-    sha256_update(&c, inner, 32);
-    sha256_final_copy(c, out);
-}
-
-static void hkdf_extract(const u8 *salt, size_t slen, const u8 *ikm, size_t ilen, u8 out[32]) {
-    hmac_sha256(salt, slen, ikm, ilen, out);
-}
-static void hkdf_expand(const u8 *prk, const u8 *info, size_t ilen, u8 *out, size_t olen) {
-    u8 t[32]; size_t tlen = 0; u8 buf[512]; size_t off = 0; u8 ctr = 1;
-    while (off < olen) {
-        size_t n = 0;
-        memcpy(buf+n, t, tlen); n += tlen;
-        memcpy(buf+n, info, ilen); n += ilen;
-        buf[n++] = ctr++;
-        hmac_sha256(prk, 32, buf, n, t);
-        tlen = 32;
-        size_t take = (olen-off) < 32 ? (olen-off) : 32;
-        memcpy(out+off, t, take);
-        off += take;
-    }
-}
-/* HkdfLabel = length(2) || "tls13 "+label (1-byte len prefixed) || context (1-byte len prefixed) */
-static void expand_label(const u8 secret[32], const char *label, const u8 *ctx, size_t ctxlen,
-                          u8 *out, size_t outlen) {
-    u8 info[512]; size_t n = 0;
-    info[n++] = outlen >> 8; info[n++] = outlen & 0xff;
-    size_t llen = strlen(label);
-    u8 full_label_len = (u8)(6 + llen);
-    info[n++] = full_label_len;
-    memcpy(info+n, "tls13 ", 6); n += 6;
-    memcpy(info+n, label, llen); n += llen;
-    info[n++] = (u8)ctxlen;
-    memcpy(info+n, ctx, ctxlen); n += ctxlen;
-    hkdf_expand(secret, info, n, out, outlen);
-}
-static void derive_secret(const u8 secret[32], const char *label, sha256_ctx transcript, u8 out[32]) {
-    u8 h[32]; sha256_final_copy(transcript, h);
-    expand_label(secret, label, h, 32, out, 32);
-}
-
-/* ======================================================================
- * X25519  (field arithmetic derived from the well-known TweetNaCl layout:
- * base-2^16, 16-limb representation of GF(2^255-19))
- * ==================================================================== */
-
-typedef int64_t gf[16];
-static const gf _121665 = {0xDB41,1};
-
-static void gf_carry(gf o) {
-    int64_t c;
-    for (int i=0;i<16;i++) {
-        o[i] += (1LL<<16);
-        c = o[i] >> 16;
-        o[(i+1)*(i<15)] += c-1+37*(c-1)*(i==15);
-        o[i] -= c*65536LL; /* equivalent to c<<16, but well-defined when c is negative */
-    }
-}
-static void gf_sel(gf p, gf q, int b) {
-    int64_t t, c = ~(int64_t)(b-1);
-    for (int i=0;i<16;i++) { t = c & (p[i]^q[i]); p[i]^=t; q[i]^=t; }
-}
-static void gf_pack(u8 *o, const gf n) {
-    gf m, t;
-    memcpy(t, n, sizeof(gf));
-    gf_carry(t); gf_carry(t); gf_carry(t);
-    for (int j=0;j<2;j++) {
-        m[0] = t[0]-0xffed;
-        for (int i=1;i<15;i++) { m[i] = t[i]-0xffff-((m[i-1]>>16)&1); m[i-1] &= 0xffff; }
-        m[15] = t[15]-0x7fff-((m[14]>>16)&1);
-        int b = (m[15]>>16)&1;
-        m[14] &= 0xffff;
-        gf_sel(t, m, 1-b);
-    }
-    for (int i=0;i<16;i++) { o[2*i]=t[i]&0xff; o[2*i+1]=t[i]>>8; }
-}
-static void gf_unpack(gf o, const u8 *n) {
-    for (int i=0;i<16;i++) o[i] = n[2*i] + ((int64_t)n[2*i+1]<<8);
-    o[15] &= 0x7fff;
-}
-static void gf_add(gf o, const gf a, const gf b){ for(int i=0;i<16;i++) o[i]=a[i]+b[i]; }
-static void gf_sub(gf o, const gf a, const gf b){ for(int i=0;i<16;i++) o[i]=a[i]-b[i]; }
-static void gf_mul(gf o, const gf a, const gf b) {
-    int64_t t[31] = {0};
-    for (int i=0;i<16;i++) for (int j=0;j<16;j++) t[i+j] += a[i]*b[j];
-    for (int i=0;i<15;i++) t[i] += 38*t[i+16];
-    memcpy(o, t, sizeof(gf));
-    gf_carry(o); gf_carry(o);
-}
-static void gf_sq(gf o, const gf a) { gf_mul(o,a,a); }
-static void gf_inv(gf o, const gf i) {
-    gf c; memcpy(c, i, sizeof(gf));
-    for (int a=253;a>=0;a--) {
-        gf_sq(c,c);
-        if (a!=2 && a!=4) gf_mul(c,c,i);
-    }
-    memcpy(o, c, sizeof(gf));
-}
-static void x25519_scalarmult(u8 q[32], const u8 n[32], const u8 p[32]) {
-    u8 z[32]; memcpy(z, n, 32); z[31]=(z[31]&127)|64; z[0]&=248;
-    gf x, a, bb, c, d, e, f;
-    gf_unpack(x, p);
-    for (int i=0;i<16;i++) { bb[i]=x[i]; d[i]=a[i]=c[i]=0; }
-    a[0]=d[0]=1;
-    for (int i=254;i>=0;i--) {
-        int64_t r = (z[i>>3]>>(i&7))&1;
-        gf_sel(a,bb,r); gf_sel(c,d,r);
-        gf_add(e,a,c); gf_sub(a,a,c);
-        gf_add(c,bb,d); gf_sub(bb,bb,d);
-        gf_sq(d,e); gf_sq(f,a);
-        gf_mul(a,c,a); gf_mul(c,bb,e);
-        gf_add(e,a,c); gf_sub(a,a,c);
-        gf_sq(bb,a);
-        gf_sub(c,d,f);
-        gf_mul(a,c,_121665);
-        gf_add(a,a,d);
-        gf_mul(c,c,a);
-        gf_mul(a,d,f);
-        gf_mul(d,bb,x);
-        gf_sq(bb,e);
-        gf_sel(a,bb,r); gf_sel(c,d,r);
-    }
-    gf_inv(c,c);
-    gf_mul(a,a,c);
-    gf_pack(q,a);
-}
-static void x25519_base(u8 q[32], const u8 n[32]) {
-    static const u8 base[32] = {9};
-    x25519_scalarmult(q, n, base);
-}
-
-/* ======================================================================
- * ChaCha20 / Poly1305 / AEAD  (RFC 8439)
- * ==================================================================== */
-
-#define CROT(x,n) (((x)<<(n))|((x)>>(32-(n))))
-static void chacha20_block(const u8 key[32], u32 counter, const u8 nonce[12], u8 out[64]) {
-    u32 s[16] = {
-        0x61707865,0x3320646e,0x79622d32,0x6b206574,
-        0,0,0,0,0,0,0,0, counter,0,0,0
-    };
-    for (int i=0;i<8;i++) s[4+i] = key[4*i]|(key[4*i+1]<<8)|(key[4*i+2]<<16)|((u32)key[4*i+3]<<24);
-    for (int i=0;i<3;i++) s[13+i] = nonce[4*i]|(nonce[4*i+1]<<8)|(nonce[4*i+2]<<16)|((u32)nonce[4*i+3]<<24);
-    u32 w[16]; memcpy(w,s,sizeof w);
-#define QR(a,b,c,d) a+=b;d^=a;d=CROT(d,16); c+=d;b^=c;b=CROT(b,12); a+=b;d^=a;d=CROT(d,8); c+=d;b^=c;b=CROT(b,7)
-    for (int i=0;i<10;i++) {
-        QR(w[0],w[4],w[8],w[12]); QR(w[1],w[5],w[9],w[13]);
-        QR(w[2],w[6],w[10],w[14]); QR(w[3],w[7],w[11],w[15]);
-        QR(w[0],w[5],w[10],w[15]); QR(w[1],w[6],w[11],w[12]);
-        QR(w[2],w[7],w[8],w[13]); QR(w[3],w[4],w[9],w[14]);
-    }
-    for (int i=0;i<16;i++) w[i]+=s[i];
-    for (int i=0;i<16;i++) { out[4*i]=w[i]; out[4*i+1]=w[i]>>8; out[4*i+2]=w[i]>>16; out[4*i+3]=w[i]>>24; }
-}
-static void chacha20_xor(const u8 key[32], u32 counter, const u8 nonce[12],
-                          const u8 *in, u8 *out, size_t len) {
-    u8 block[64]; size_t off = 0;
-    while (off < len) {
-        chacha20_block(key, counter++, nonce, block);
-        size_t take = (len-off)<64?(len-off):64;
-        for (size_t i=0;i<take;i++) out[off+i] = in[off+i]^block[i];
-        off += take;
-    }
-}
-
-#define M26 0x3ffffffULL
-static void poly1305_block(u64 h[5], const u64 r[5], const u8 *m, size_t blocklen /* <=16 */) {
-    u8 buf[16] = {0};
-    memcpy(buf, m, blocklen);
-    if (blocklen < 16) buf[blocklen] = 0x01;
-    u64 lo=0, hi=0;
-    for (int i=0;i<8;i++) lo |= (u64)buf[i]<<(8*i);
-    for (int i=0;i<8;i++) hi |= (u64)buf[8+i]<<(8*i);
-    u64 t0 = lo & M26;
-    u64 t1 = (lo>>26) & M26;
-    u64 t2 = ((lo>>52) | (hi<<12)) & M26;
-    u64 t3 = (hi>>14) & M26;
-    u64 t4 = (hi>>40) & M26;
-    if (blocklen == 16) t4 += (1ULL<<24);
-    h[0]+=t0; h[1]+=t1; h[2]+=t2; h[3]+=t3; h[4]+=t4;
-
-    u64 p[9] = {0};
-    for (int i=0;i<5;i++) for (int j=0;j<5;j++) p[i+j] += h[i]*r[j];
-    for (int k=8;k>=5;k--) { p[k-5] += 5*p[k]; p[k]=0; }
-    u64 carry = 0;
-    for (int i=0;i<5;i++) { p[i]+=carry; carry = p[i]>>26; p[i]&=M26; }
-    p[0] += 5*carry;
-    carry = p[0]>>26; p[0]&=M26; p[1]+=carry;
-    for (int i=0;i<5;i++) h[i]=p[i];
-}
-static void poly1305_mac(const u8 key[32], const u8 *msg, size_t len, u8 tag[16]) {
-    u8 rraw[16]; memcpy(rraw, key, 16);
-    rraw[3]&=15; rraw[7]&=15; rraw[11]&=15; rraw[15]&=15;
-    rraw[4]&=252; rraw[8]&=252; rraw[12]&=252;
-    u64 lo=0, hi=0;
-    for (int i=0;i<8;i++) lo |= (u64)rraw[i]<<(8*i);
-    for (int i=0;i<8;i++) hi |= (u64)rraw[8+i]<<(8*i);
-    u64 r[5];
-    r[0]=lo&M26; r[1]=(lo>>26)&M26; r[2]=((lo>>52)|(hi<<12))&M26; r[3]=(hi>>14)&M26; r[4]=(hi>>40)&M26;
-    u64 h[5] = {0,0,0,0,0};
-    size_t off = 0;
-    while (off < len) {
-        size_t take = (len-off)<16?(len-off):16;
-        poly1305_block(h, r, msg+off, take);
-        off += take;
-    }
-    /* final full reduce mod p=2^130-5 */
-    u64 carry = 0;
-    for (int i=0;i<5;i++) { h[i]+=carry; carry=h[i]>>26; h[i]&=M26; }
-    h[0] += 5*carry; carry = h[0]>>26; h[0]&=M26; h[1]+=carry;
-    u64 g[5];
-    u64 c2 = 5;
-    for (int i=0;i<5;i++) { g[i] = h[i]+c2; c2 = g[i]>>26; g[i]&=M26; }
-    g[4] -= (1ULL<<26); /* subtract 2^130 contribution to compare against p */
-    u64 mask = (g[4] >> 63) ? 0 : ~0ULL; /* if g underflowed (h<p), g invalid -> use h */
-    for (int i=0;i<5;i++) h[i] = (h[i] & ~mask) | (g[i] & mask);
-    /* Pack h's 5x26-bit limbs into a 128-bit value as two u64 halves (lo, hi),
-       dropping any bit at position >=128 -- safe because the tag is defined as
-       (h+s) mod 2^128 anyway, so those bits would be discarded regardless.
-       global bit layout: limb0[0,26) limb1[26,52) limb2[52,78) limb3[78,104) limb4[104,130) */
-    u64 t_lo = h[0] | (h[1]<<26) | ((h[2] & 0xfffULL) << 52);
-    u64 t_hi = (h[2] >> 12) | (h[3] << 14) | ((h[4] & 0xffffffULL) << 40);
-    u64 slo=0, shi=0;
-    for (int i=0;i<8;i++) slo |= (u64)key[16+i]<<(8*i);
-    for (int i=0;i<8;i++) shi |= (u64)key[24+i]<<(8*i);
-    u64 rlo = t_lo + slo;
-    u64 rcarry = (rlo < t_lo) ? 1 : 0; /* detect the wraparound manually */
-    u64 rhi = t_hi + shi + rcarry;     /* mod 2^128 via natural u64 wraparound */
-    for (int i=0;i<8;i++) tag[i]   = (u8)(rlo >> (8*i));
-    for (int i=0;i<8;i++) tag[8+i] = (u8)(rhi >> (8*i));
-}
-
-/* AEAD_CHACHA20_POLY1305 per RFC 8439 */
-static void pad16(sha256_ctx *unused){ (void)unused; } /* placeholder, real pad done inline below */
-
-static void aead_seal(const u8 key[32], const u8 nonce[12], const u8 *aad, size_t aadlen,
-                       const u8 *pt, size_t ptlen, u8 *out /* ptlen + 16 */) {
-    u8 polykey[64];
-    chacha20_block(key, 0, nonce, polykey);
-    chacha20_xor(key, 1, nonce, pt, out, ptlen);
-    u8 macbuf[BUFSZ]; size_t n = 0;
-    memcpy(macbuf+n, aad, aadlen); n += aadlen;
-    while (n % 16) macbuf[n++] = 0;
-    memcpy(macbuf+n, out, ptlen); n += ptlen;
-    while (n % 16) macbuf[n++] = 0;
-    u64 al = aadlen, pl = ptlen;
-    for (int i=0;i<8;i++) macbuf[n++] = (u8)(al>>(8*i));
-    for (int i=0;i<8;i++) macbuf[n++] = (u8)(pl>>(8*i));
-    u8 tag[16];
-    poly1305_mac(polykey, macbuf, n, tag);
-    memcpy(out+ptlen, tag, 16);
-}
-/* returns 1 on tag mismatch (we log it but, true to the "insecure" spirit,
-   do NOT abort -- a real client obviously must) */
-static int aead_open(const u8 key[32], const u8 nonce[12], const u8 *aad, size_t aadlen,
-                      const u8 *ct, size_t ctlen /* includes 16-byte tag */, u8 *out) {
-    size_t ptlen = ctlen - 16;
-    u8 polykey[64];
-    chacha20_block(key, 0, nonce, polykey);
-    u8 macbuf[BUFSZ]; size_t n = 0;
-    memcpy(macbuf+n, aad, aadlen); n += aadlen;
-    while (n % 16) macbuf[n++] = 0;
-    memcpy(macbuf+n, ct, ptlen); n += ptlen;
-    while (n % 16) macbuf[n++] = 0;
-    u64 al = aadlen, pl = ptlen;
-    for (int i=0;i<8;i++) macbuf[n++] = (u8)(al>>(8*i));
-    for (int i=0;i<8;i++) macbuf[n++] = (u8)(pl>>(8*i));
-    u8 tag[16]; poly1305_mac(polykey, macbuf, n, tag);
-    int mismatch = memcmp(tag, ct+ptlen, 16) != 0;
-    chacha20_xor(key, 1, nonce, ct, out, ptlen);
-    return mismatch;
-}
+#include "crypto/sha256.h"
+#include "crypto/handshake_crypto.h"
 
 /* ======================================================================
  * TCP plumbing
  * ==================================================================== */
+
 /* Appends a formatted string to buf at offset off, never writing past bufsz
    and never returning an offset that could underflow a later bufsz-off. Used
    to build the HTTP request line-by-line with a variable number of -H
@@ -425,13 +63,14 @@ static size_t buf_append(char *buf, size_t bufsz, size_t off, const char *fmt, .
     return neww < bufsz ? neww : bufsz;
 }
 
-/* True if `line` is (or starts) a header with the given name, e.g.
-   header_name_is("Host: example.com", "Host") -> true. Case-insensitive,
-   as HTTP header names are. */
+/* True if `line` is an HTTP header with the name `name` e.g.
+   header_name_is("Host: example.com", "Host") -> true.
+   Case-insensitive, as HTTP header names are. */
 static int header_name_is(const char *line, const char *name) {
     size_t nlen = strlen(name);
     return strncasecmp(line, name, nlen) == 0 && line[nlen] == ':';
 }
+
 static int has_header(const char *const *headers, int n, const char *name) {
     for (int i = 0; i < n; i++) if (header_name_is(headers[i], name)) return 1;
     return 0;
@@ -452,6 +91,7 @@ static int tcp_connect(const char *host, const char *port) {
     if (fd < 0) { fprintf(stderr, "connect failed\n"); exit(1); }
     return fd;
 }
+
 static void send_all(int fd, const u8 *buf, size_t n) {
     size_t off = 0;
     while (off < n) {
@@ -460,6 +100,7 @@ static void send_all(int fd, const u8 *buf, size_t n) {
         off += w;
     }
 }
+
 static void recv_all(int fd, u8 *buf, size_t n) {
     size_t off = 0;
     while (off < n) {
@@ -472,7 +113,6 @@ static void recv_all(int fd, u8 *buf, size_t n) {
 /* ======================================================================
  * TLS 1.3 engine
  * ==================================================================== */
-
 typedef struct {
     int fd;
     sha256_ctx transcript;
@@ -551,6 +191,7 @@ static void hs_fill(tls_t *t, int decrypt) {
         }
     }
 }
+
 static void hs_read(tls_t *t, u8 *out, size_t n, int decrypt) {
     while (t->hslen - t->hsoff < n) hs_fill(t, decrypt);
     memcpy(out, t->hsbuf+t->hsoff, n);
@@ -558,20 +199,41 @@ static void hs_read(tls_t *t, u8 *out, size_t n, int decrypt) {
     if (t->hsoff == t->hslen) t->hsoff = t->hslen = 0;
 }
 
+/* Raw bytes of the two handshake messages the certificate verifier needs,
+   plus the one piece of derived state it needs and can't recompute itself:
+   the transcript hash as it stood *before* CertificateVerify was hashed in
+   (RFC 8446 4.4.3 signs exactly that hash, not the final one). Everything
+   else (chain parsing, signature verification, hostname/expiry checks)
+   happens out-of-process in the verifier helper -- see verify_certificate(). */
+typedef struct {
+    u8 cert_msg[BUFSZ];       size_t cert_msg_len;       int have_cert;
+    u8 certverify_msg[BUFSZ]; size_t certverify_msg_len; int have_certverify;
+    u8 transcript_before_certverify[32];
+} handshake_capture_t;
+
 /* Reads and hashes handshake messages (EncryptedExtensions, Certificate,
-   CertificateVerify, ...) until the server's Finished message, discarding
-   their content entirely -- see the top-of-file note on why. Its BUFSZ-sized
-   scratch buffer lives in this function's own stack frame, not main's. */
-static void consume_handshake_to_finished(tls_t *t) {
+   CertificateVerify, ...) until the server's Finished message. Certificate
+   and CertificateVerify are additionally copied out verbatim into *cap
+   (unless cap == NULL, as is the case when -k is specified).
+   Either way, we don't parse any of that, cap is passed to a separate
+   companion binary, compiled from nanocurl-verify.c */
+static void consume_handshake_to_finished(tls_t *t, handshake_capture_t *cap) {
+    if (cap) memset(cap, 0, sizeof *cap);
     for (;;) {
         u8 hh[4]; hs_read(t, hh, 4, 1);
         size_t hl = (hh[1]<<16)|(hh[2]<<8)|hh[3];
         u8 hb[BUFSZ]; hs_read(t, hb, hl, 1);
+        if (cap && hh[0] == 15 /* CertificateVerify */)
+            sha256_final_copy(t->transcript, cap->transcript_before_certverify);
         sha256_update(&t->transcript, hh, 4);
         sha256_update(&t->transcript, hb, hl);
+        if (cap && hh[0] == 11 && hl <= sizeof cap->cert_msg) {
+            memcpy(cap->cert_msg, hb, hl); cap->cert_msg_len = hl; cap->have_cert = 1;
+        }
+        if (cap && hh[0] == 15 && hl <= sizeof cap->certverify_msg) {
+            memcpy(cap->certverify_msg, hb, hl); cap->certverify_msg_len = hl; cap->have_certverify = 1;
+        }
         if (hh[0] == 20) break; /* Finished */
-        /* EncryptedExtensions / Certificate / CertificateVerify: intentionally
-           not parsed at all -- this is the whole point of the exercise. */
     }
 }
 
@@ -673,7 +335,6 @@ static int ci_contains(const char *hay, const char *needle) {
    program's ambitions exactly. */
 static void stream_http_response(tls_t *t, int show_headers) {
     respstream_t rs; rs_init(&rs, t);
-
     char hdrbuf[8192]; size_t hdrlen = 0;
     int crlf_run = 0;
     for (;;) {
@@ -690,12 +351,10 @@ static void stream_http_response(tls_t *t, int show_headers) {
     }
     hdrbuf[hdrlen] = '\0';
     int chunked = ci_contains(hdrbuf, "transfer-encoding:") && ci_contains(hdrbuf, "chunked");
-
     if (!chunked) {
         while (rs_copy(&rs, stdout, BUFSZ) > 0) { /* keep draining until EOF */ }
         return;
     }
-
     for (;;) {
         char sizeline[64]; size_t sl = 0;
         for (;;) {
@@ -725,21 +384,26 @@ static void stream_http_response(tls_t *t, int show_headers) {
 #define MAX_EXTRA_HEADERS 32
 typedef struct {
     int show_headers;
+    int insecure; /* -k / --insecure: skip the verifier helper entirely, as before */
     const char *extra_headers[MAX_EXTRA_HEADERS];
     int n_extra_headers;
     const char *url; /* borrowed pointer into argv */
 } parsed_args_t;
 
-/* Parses -D - and any number of -H 'Header: value' flags, in any order,
-   preceding the URL. Returns 1 with out->url set on success, 0 if no URL
-   token was found (caller should print usage and bail). */
+/* Parses -D -, -k/--insecure, and any number of -H 'Header: value' flags, in
+   any order, preceding the URL. Returns 1 with out->url set on success, 0 if
+   no URL token was found (caller should print usage and bail). */
 static int parse_args(int argc, char **argv, parsed_args_t *out) {
     out->show_headers = 0;
+    out->insecure = 0;
     out->n_extra_headers = 0;
     int argi = 1;
     while (argi < argc) {
         if (strcmp(argv[argi], "-D") == 0 && argi+1 < argc && strcmp(argv[argi+1], "-") == 0) {
             out->show_headers = 1; argi += 2; continue;
+        }
+        if (strcmp(argv[argi], "-k") == 0 || strcmp(argv[argi], "--insecure") == 0) {
+            out->insecure = 1; argi += 1; continue;
         }
         if (strcmp(argv[argi], "-H") == 0 && argi+1 < argc) {
             if (out->n_extra_headers < MAX_EXTRA_HEADERS)
@@ -791,11 +455,119 @@ static void parse_url(const char *url, parsed_url_t *out) {
     }
 }
 
+/* ======================================================================
+ * Certificate verification, out-of-process.
+ *
+ * Everything that actually needs to understand X.509 (ASN.1, RSA/ECDSA/
+ * Ed25519 signature checks, trust-store path building, hostname matching)
+ * lives in the separate `nanocurl-verify` binary. *This* binary's job is to:
+ *   1. serialize the handful of already-captured handshake bytes over a pipe;
+ *   2. wait for an exit code from verifier;
+ *   3. abort the connection on failure.
+ * ==================================================================== */
+
+static void wr_all(int fd, const void *buf, size_t n) {
+    const u8 *p = buf; size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, p+off, n-off);
+        if (w <= 0) { fprintf(stderr, "nanocurl: write to verifier failed: %s\n", strerror(errno)); exit(1); }
+        off += (size_t)w;
+    }
+}
+
+static void wr_u16(int fd, size_t v) { u8 b[2] = {(u8)(v>>8), (u8)v}; wr_all(fd, b, 2); }
+static void wr_u24(int fd, size_t v) { u8 b[3] = {(u8)(v>>16), (u8)(v>>8), (u8)v}; wr_all(fd, b, 3); }
+
+/* Wire format written to the verifier's stdin (all lengths big-endian):
+ *   u8      version (1)
+ *   u16     hostname length, then that many bytes
+ *   u16     CertificateVerify signature_algorithm (as sent on the wire)
+ *   u16     signature length, then that many bytes
+ *   32B     transcript hash covering ClientHello..Certificate (not CertVerify)
+ *   u16     number of certificates
+ *   for each: u24 DER length, then that many DER bytes (leaf first)
+ *
+ * Parsing the TLS Certificate/CertificateVerify message *framing* below is
+ * just reading the length-prefixed fields the TLS RFC defines for them --
+ * not X.509 -- so it stays here. Not one byte of the DER payloads themselves
+ * is inspected; they're copied through untouched for the helper to parse.
+ */
+static void send_verify_request(int fd, const handshake_capture_t *cap, const char *host) {
+    if (cap->certverify_msg_len < 4) { fprintf(stderr, "nanocurl: malformed CertificateVerify\n"); exit(1); }
+    const u8 *cv = cap->certverify_msg;
+    size_t sigalg = ((size_t)cv[0]<<8)|cv[1];
+    size_t siglen = ((size_t)cv[2]<<8)|cv[3];
+    if (4+siglen > cap->certverify_msg_len) { fprintf(stderr, "nanocurl: malformed CertificateVerify\n"); exit(1); }
+    const u8 *sig = cv+4;
+
+    const u8 *cm = cap->cert_msg;
+    size_t cmlen = cap->cert_msg_len;
+    if (cmlen < 1) { fprintf(stderr, "nanocurl: malformed Certificate message\n"); exit(1); }
+    size_t p = 0;
+    u8 ctxlen = cm[p]; p += 1 + ctxlen;
+    if (p+3 > cmlen) { fprintf(stderr, "nanocurl: malformed Certificate message\n"); exit(1); }
+    size_t listlen = ((size_t)cm[p]<<16)|((size_t)cm[p+1]<<8)|cm[p+2]; p += 3;
+    size_t listend = p + listlen;
+    if (listend > cmlen) { fprintf(stderr, "nanocurl: malformed Certificate message\n"); exit(1); }
+
+    size_t ncerts = 0;
+    for (size_t q = p; q < listend; ncerts++) {
+        if (q+3 > listend) { fprintf(stderr, "nanocurl: malformed Certificate message\n"); exit(1); }
+        size_t dl = ((size_t)cm[q]<<16)|((size_t)cm[q+1]<<8)|cm[q+2]; q += 3+dl;
+        if (q+2 > listend) { fprintf(stderr, "nanocurl: malformed Certificate message\n"); exit(1); }
+        size_t el = ((size_t)cm[q]<<8)|cm[q+1]; q += 2+el;
+        if (q > listend) { fprintf(stderr, "nanocurl: malformed Certificate message\n"); exit(1); }
+    }
+
+    u8 version = 1;
+    wr_all(fd, &version, 1);
+    size_t hlen = strlen(host);
+    wr_u16(fd, hlen); wr_all(fd, host, hlen);
+    wr_u16(fd, sigalg);
+    wr_u16(fd, siglen); wr_all(fd, sig, siglen);
+    wr_all(fd, cap->transcript_before_certverify, 32);
+    wr_u16(fd, ncerts);
+    for (size_t q = p; q < listend; ) {
+        size_t dl = ((size_t)cm[q]<<16)|((size_t)cm[q+1]<<8)|cm[q+2]; q += 3;
+        wr_u24(fd, dl); wr_all(fd, cm+q, dl); q += dl;
+        size_t el = ((size_t)cm[q]<<8)|cm[q+1]; q += 2+el;
+    }
+}
+
+/* Forks nanocurl-verify (found via $PATH), feeds it the wire-format request
+   above on its stdin, and returns 1 iff it exits 0. The helper's stderr is
+   inherited, so on failure it has already printed the reason itself --
+   that's the whole reason it's a fork+exit-code away rather than a linked-in
+   function call. Returns 0 (fail closed) if we fail to run the verifier */
+static int verify_certificate(const handshake_capture_t *cap, const char *host) {
+    if (!cap->have_cert) { fprintf(stderr, "nanocurl: server sent no certificate\n"); return 0; }
+    if (!cap->have_certverify) { fprintf(stderr, "nanocurl: server sent no CertificateVerify\n"); return 0; }
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) { fprintf(stderr, "nanocurl: pipe: %s\n", strerror(errno)); return 0; }
+    pid_t pid = fork();
+    if (pid < 0) { fprintf(stderr, "nanocurl: fork: %s\n", strerror(errno)); return 0; }
+    if (pid == 0) {
+        dup2(pipefd[0], 0);
+        close(pipefd[0]); close(pipefd[1]);
+        execlp("nanocurl-verify", "nanocurl-verify", (char *)NULL);
+        fprintf(stderr, "nanocurl: cannot exec nanocurl-verify (is it installed and on $PATH?): %s\n",
+                strerror(errno));
+        _exit(127);
+    }
+    close(pipefd[0]);
+    send_verify_request(pipefd[1], cap, host);
+    close(pipefd[1]);
+    int status;
+    if (waitpid(pid, &status, 0) < 0) { fprintf(stderr, "nanocurl: waitpid: %s\n", strerror(errno)); return 0; }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
 #ifndef NANOCURL_NO_MAIN
 int main(int argc, char **argv) {
     parsed_args_t args;
     if (!parse_args(argc, argv, &args)) {
-        fprintf(stderr, "usage: %s [-D -] [-H 'Header: value']... [https://]host[:port][/path]\n", argv[0]);
+        fprintf(stderr, "usage: %s [-D -] [-k] [-H 'Header: value']... [https://]host[:port][/path]\n", argv[0]);
         return 1;
     }
     parsed_url_t u;
@@ -819,15 +591,14 @@ int main(int argc, char **argv) {
     /* --- build ClientHello --- */
     u8 ch[1024]; size_t n = 0;
     u8 crandom[32]; rf = fopen("/dev/urandom","rb"); fread(crandom,1,32,rf); fclose(rf);
-
     u8 body[900]; size_t bn = 0;
-    body[bn++]=0x03; body[bn++]=0x03;               /* legacy_version */
-    memcpy(body+bn, crandom, 32); bn += 32;          /* random */
-    body[bn++] = 32;                                 /* legacy_session_id len */
-    memcpy(body+bn, crandom, 32); bn += 32;           /* (reuse random bytes, doesn't matter) */
-    body[bn++]=0x00; body[bn++]=0x02;                 /* cipher_suites len=2 */
-    body[bn++]=0x13; body[bn++]=0x03;                  /* TLS_CHACHA20_POLY1305_SHA256 */
-    body[bn++]=0x01; body[bn++]=0x00;                 /* compression: len=1, null */
+    body[bn++]=0x03; body[bn++]=0x03; /* legacy_version */
+    memcpy(body+bn, crandom, 32); bn += 32; /* random */
+    body[bn++] = 32; /* legacy_session_id len */
+    memcpy(body+bn, crandom, 32); bn += 32; /* (reuse random bytes, doesn't matter) */
+    body[bn++]=0x00; body[bn++]=0x02; /* cipher_suites len=2 */
+    body[bn++]=0x13; body[bn++]=0x03; /* TLS_CHACHA20_POLY1305_SHA256 */
+    body[bn++]=0x01; body[bn++]=0x00; /* compression: len=1, null */
 
     u8 ext[512]; size_t en = 0;
     /* server_name */
@@ -880,6 +651,7 @@ int main(int argc, char **argv) {
         ext[en++]=(u8)plen;
         memcpy(ext+en, proto, plen); en += plen;
     }
+
     body[bn++]=(en>>8); body[bn++]=en;
     memcpy(body+bn, ext, en); bn += en;
 
@@ -902,9 +674,9 @@ int main(int argc, char **argv) {
     /* parse just enough of ServerHello to get the server's key_share pubkey */
     u8 server_pub[32] = {0};
     { size_t p = 2+32; /* skip legacy_version, random */
-      u8 sidlen = shbody[p]; p += 1+sidlen;   /* session_id echo */
-      p += 2;                                  /* cipher_suite */
-      p += 1;                                  /* legacy_compression_method */
+      u8 sidlen = shbody[p]; p += 1+sidlen; /* session_id echo */
+      p += 2; /* cipher_suite */
+      p += 1; /* legacy_compression_method */
       size_t extlen = (shbody[p]<<8)|shbody[p+1]; p += 2;
       size_t end = p+extlen;
       while (p < end) {
@@ -922,25 +694,28 @@ int main(int argc, char **argv) {
     u8 zero32[32] = {0};
     u8 early[32]; hkdf_extract(zero32, 32, zero32, 32, early);
     u8 derived1[32]; { sha256_ctx snap; sha256_init(&snap); derive_secret(early, "derived", snap, derived1); }
-
     u8 shared[32]; x25519_scalarmult(shared, priv, server_pub);
     u8 hs_secret[32]; hkdf_extract(derived1, 32, shared, 32, hs_secret);
-
     u8 c_hs_secret[32], s_hs_secret[32];
     derive_secret(hs_secret, "c hs traffic", t.transcript, c_hs_secret);
     derive_secret(hs_secret, "s hs traffic", t.transcript, s_hs_secret);
-
     expand_label(c_hs_secret, "key", (u8*)"", 0, t.c_key, 32);
-    expand_label(c_hs_secret, "iv",  (u8*)"", 0, t.c_iv, 12);
+    expand_label(c_hs_secret, "iv", (u8*)"", 0, t.c_iv, 12);
     expand_label(s_hs_secret, "key", (u8*)"", 0, t.s_key, 32);
-    expand_label(s_hs_secret, "iv",  (u8*)"", 0, t.s_iv, 12);
+    expand_label(s_hs_secret, "iv", (u8*)"", 0, t.s_iv, 12);
     t.c_seq = t.s_seq = 0;
 
-    /* --- consume EncryptedExtensions, Certificate, CertificateVerify, Finished
-           (hash-only skip; see consume_handshake_to_finished) --- */
-    consume_handshake_to_finished(&t);
-    /* IMPORTANT: application_traffic_secret derivation (RFC 8446 sec 7.1) uses
-       the transcript hash through ClientHello...server Finished -- it must NOT
+    /* consume EncryptedExtensions, Certificate, CertificateVerify, Finished. */
+    handshake_capture_t cap;
+    consume_handshake_to_finished(&t, args.insecure ? NULL : &cap);
+    if (!args.insecure && !verify_certificate(&cap, host)) {
+        fprintf(stderr, "nanocurl: aborting (use -k to skip certificate verification)\n");
+        close(t.fd);
+        return 1;
+    }
+
+    /* application_traffic_secret derivation (RFC 8446 sec 7.1) uses the
+       transcript hash through ClientHello...server Finished -- it must NOT
        include our own client Finished, which we're about to hash in next. */
     sha256_ctx transcript_after_server_finished = t.transcript;
 
@@ -958,14 +733,13 @@ int main(int argc, char **argv) {
     u8 derived2[32];
     { sha256_ctx empty; sha256_init(&empty); derive_secret(hs_secret, "derived", empty, derived2); }
     u8 master[32]; hkdf_extract(derived2, 32, zero32, 32, master);
-
     u8 c_ap_secret[32], s_ap_secret[32];
     derive_secret(master, "c ap traffic", transcript_after_server_finished, c_ap_secret);
     derive_secret(master, "s ap traffic", transcript_after_server_finished, s_ap_secret);
     expand_label(c_ap_secret, "key", (u8*)"", 0, t.c_key, 32);
-    expand_label(c_ap_secret, "iv",  (u8*)"", 0, t.c_iv, 12);
+    expand_label(c_ap_secret, "iv", (u8*)"", 0, t.c_iv, 12);
     expand_label(s_ap_secret, "key", (u8*)"", 0, t.s_key, 32);
-    expand_label(s_ap_secret, "iv",  (u8*)"", 0, t.s_iv, 12);
+    expand_label(s_ap_secret, "iv", (u8*)"", 0, t.s_iv, 12);
     t.c_seq = t.s_seq = 0;
 
     /* --- HTTP/1.1 GET, hand-rolled --- */

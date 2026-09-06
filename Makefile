@@ -1,4 +1,4 @@
-# nanocurl -- teeniest-tiniest insecure TLS 1.3 + HTTP/1.1 client.
+# nanocurl -- teeniest-tiniest TLS 1.3 + HTTP/1.1 client.
 #
 #   make            build ./nanocurl
 #   make test       build and run the whole test suite (see tests/)
