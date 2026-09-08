@@ -89,4 +89,47 @@ openssl x509 -req -in leaf384.csr -CA inter384.pem -CAkey inter384.key -CAcreate
     -extfile /tmp/nanocurl_test_openssl.cnf -extensions v3_leaf -sha384 -outform der -out leaf384.der 2>/dev/null
 
 rm -f root.key inter.key inter384.key leaf.key leaf384.key inter.csr inter384.csr leaf.csr leaf384.csr *.srl root.pem inter.pem inter384.pem
+
+# A cross-signed-root scenario: a modern root that's directly present in
+# the trust store (self-signed), but is *also* cross-signed by a separate,
+# untrusted-by-us legacy root purely for old-client compatibility -- the
+# same shape that surfaced a real gap (see nanocurl-verify.c's
+# handrolled_verify_chain_with_store comment): a server can send a chain
+# that ends in that cross-signed cert, and a correct verifier must still
+# accept it by terminating trust one hop earlier, at the intermediate's
+# issuer, rather than insisting on validating all the way to the last
+# server-supplied certificate.
+openssl ecparam -genkey -name prime256v1 -noout -out crossroot_new.key 2>/dev/null
+openssl req -x509 -new -key crossroot_new.key -subj "/CN=nanocurl Test Modern Root" -days 3650 \
+    -config /tmp/nanocurl_test_openssl.cnf -extensions v3_ca -sha256 -out crossroot_new_selfsigned.pem 2>/dev/null
+
+openssl ecparam -genkey -name prime256v1 -noout -out crossroot_old.key 2>/dev/null
+openssl req -x509 -new -key crossroot_old.key -subj "/CN=nanocurl Test Legacy Root" -days 3650 \
+    -config /tmp/nanocurl_test_openssl.cnf -extensions v3_ca -sha256 -out crossroot_old.pem 2>/dev/null
+
+openssl req -new -key crossroot_new.key -subj "/CN=nanocurl Test Modern Root" -out crossroot_new.csr 2>/dev/null
+openssl x509 -req -in crossroot_new.csr -CA crossroot_old.pem -CAkey crossroot_old.key -CAcreateserial -days 3650 \
+    -extfile /tmp/nanocurl_test_openssl.cnf -extensions v3_ca -sha256 -outform der -out crossroot_new_crosssigned.der 2>/dev/null
+
+openssl ecparam -genkey -name prime256v1 -noout -out crossinter.key 2>/dev/null
+openssl req -new -key crossinter.key -subj "/CN=nanocurl Test Cross Intermediate" -out crossinter.csr 2>/dev/null
+openssl x509 -req -in crossinter.csr -CA crossroot_new_selfsigned.pem -CAkey crossroot_new.key -CAcreateserial -days 3650 \
+    -extfile /tmp/nanocurl_test_openssl.cnf -extensions v3_intermediate -sha256 -outform der -out crossinter.der 2>/dev/null
+openssl x509 -inform der -in crossinter.der -outform pem -out crossinter.pem
+
+openssl ecparam -genkey -name prime256v1 -noout -out crossleaf.key 2>/dev/null
+openssl req -new -key crossleaf.key -subj "/CN=cross-test-leaf.example" -out crossleaf.csr 2>/dev/null
+openssl x509 -req -in crossleaf.csr -CA crossinter.pem -CAkey crossinter.key -CAcreateserial -days 3650 \
+    -extfile /tmp/nanocurl_test_openssl.cnf -extensions v3_leaf -sha256 -outform der -out crossleaf.der 2>/dev/null
+
+openssl x509 -inform pem -in crossroot_new_selfsigned.pem -outform der -out crossroot_new_selfsigned.der
+
+# Trust store variant containing only the modern root (not the legacy one
+# that cross-signed it) -- this is the scenario that must still verify.
+cp crossroot_new_selfsigned.pem crossroot_trust_store.pem
+
+rm -f crossroot_new.key crossroot_old.key crossinter.key crossleaf.key \
+      crossroot_new.csr crossinter.csr crossleaf.csr *.srl \
+      crossroot_new_selfsigned.pem crossroot_old.pem crossinter.pem
+
 echo "generated chain fixtures in chain_fixtures/"

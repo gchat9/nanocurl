@@ -10,6 +10,8 @@
  * Regenerate fixtures (only if you need to add/change one): ./gen_certs.sh
  */
 #define NANOCURL_VERIFY_NO_MAIN
+#include <stdio.h> /* this test file's own printf/fopen/etc. -- nanocurl-verify.c
+                      itself no longer pulls this in (see strlite.h) */
 #include "../nanocurl-verify.c"
 
 static int failures = 0;

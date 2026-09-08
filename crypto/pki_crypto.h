@@ -18,7 +18,6 @@
 #define NANOCURL_PKI_CRYPTO_H
 
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 #include <stddef.h>
 
@@ -120,62 +119,192 @@ static void bn_sub(bn_t *r, const bn_t *a, const bn_t *b) {
     while (r->n > 0 && r->limb[r->n - 1] == 0) r->n--;
 }
 
+/* ======================================================================
+ * bn_mod_t: a modulus bundled with its precomputed Barrett reduction
+ * constant. Everywhere the old code called bn_mulmod(r,a,b,n) inside a
+ * loop that reused the same n hundreds of times (RSA modexp, and every
+ * EC point operation during a scalar multiplication), that same n's
+ * Barrett mu is computed exactly once here and reused for every multiply
+ * against it -- computing it fresh each time would cost as much as the
+ * thing it's replacing (see bn_mod_init's comment) and defeat the point.
+ * ==================================================================== */
+typedef struct { bn_t n; bn_t mu; } bn_mod_t;
+
+static void bn_from_limbs(bn_t *r, const u32 *limbs, int n) {
+    if (n > BN_MAX_LIMBS) n = BN_MAX_LIMBS; /* call sites here keep n in range; stay safe regardless */
+    if (n < 0) n = 0;
+    if (n > 0) memcpy(r->limb, limbs, (size_t)n * sizeof(u32));
+    r->n = n;
+    while (r->n > 0 && r->limb[r->n - 1] == 0) r->n--;
+}
+
+/* mu = floor(b^(2k) / n), b = 2^32, k = n's limb count -- the constant
+   Barrett reduction needs, computed once per modulus and then reused by
+   every bn_mulmod call against it.
+   This is the one piece of actual division in this file, and it's
+   deliberately narrow rather than a generic bignum divide: the dividend
+   is always exactly a power of two (2^(64k)), never a general bignum, so
+   the standard schoolbook "long division" collapses to the same
+   bit-serial shape as the double-and-add loops elsewhere in this file --
+   process one conceptual dividend bit at a time (all zero after the
+   leading 1), each step doubling a running remainder and conditionally
+   subtracting n, recording the quotient bit produced. It costs O(k^2)
+   word-operations, i.e. about as much as a handful of the old bn_mulmod
+   calls -- paid once per modulus, not once per multiply. */
+static void bn_mod_init(bn_mod_t *m, const bn_t *n) {
+    m->n = *n;
+    int k = n->n;
+    bn_t remainder = {0}; remainder.limb[0] = 1; remainder.n = 1; /* the dividend's leading 1 bit */
+    u32 qlimbs[2 * BN_MAX_LIMBS]; /* wide enough for the full 64k-bit conceptual
+                                     dividend range; only the low ~k+1 limbs end up
+                                     nonzero, but nothing here relies on knowing
+                                     that in advance -- the trim loop below finds
+                                     the true limb count after the fact instead. */
+    memset(qlimbs, 0, sizeof qlimbs);
+    int total_bits = 64 * k; /* remaining dividend bits after that leading 1, all zero */
+    for (int i = total_bits - 1; i >= 0; i--) {
+        bn_t doubled; bn_add(&doubled, &remainder, &remainder); /* bring down a 0 bit */
+        int bit = 0;
+        if (bn_cmp(&doubled, n) >= 0) { bn_sub(&remainder, &doubled, n); bit = 1; } else { remainder = doubled; }
+        qlimbs[i / 32] |= ((u32)bit) << (i % 32);
+    }
+    int copy_limbs = k + 2 <= 2 * BN_MAX_LIMBS ? k + 2 : 2 * BN_MAX_LIMBS; /* safe over-approximation of mu's true limb count (~k+1); trimmed below */
+    bn_from_limbs(&m->mu, qlimbs, copy_limbs);
+}
+
 /* r = (a + b) mod n, given a < n and b < n (so a+b < 2n -- one conditional
    subtract always suffices, no full reduction loop needed). */
-static void bn_addmod(bn_t *r, const bn_t *a, const bn_t *b, const bn_t *n) {
+static void bn_addmod(bn_t *r, const bn_t *a, const bn_t *b, const bn_mod_t *m) {
     bn_t sum; bn_add(&sum, a, b);
-    if (bn_cmp(&sum, n) >= 0) bn_sub(r, &sum, n); else *r = sum;
+    if (bn_cmp(&sum, &m->n) >= 0) bn_sub(r, &sum, &m->n); else *r = sum;
 }
 
 /* r = (a - b) mod n, for any a, b < n (bn_sub alone only handles a >= b). */
-static void bn_submod(bn_t *r, const bn_t *a, const bn_t *b, const bn_t *n) {
+static void bn_submod(bn_t *r, const bn_t *a, const bn_t *b, const bn_mod_t *m) {
     if (bn_cmp(a, b) >= 0) { bn_sub(r, a, b); return; }
-    bn_t t; bn_sub(&t, b, a); bn_sub(r, n, &t);
+    bn_t t; bn_sub(&t, b, a); bn_sub(r, &m->n, &t);
 }
 
-/* r = (a * k) mod n for a small integer constant k, via the same
-   double-and-add technique bn_mulmod uses for two bignums. */
-static void bn_mulsmall_mod(bn_t *r, const bn_t *a, unsigned k, const bn_t *n) {
+/* r = (a * k) mod n for a small integer constant k. k is always a tiny
+   compile-time constant at every call site (2, 3, 4, or 8, from the EC
+   point-doubling/addition formulas), so plain double-and-add over k's own
+   (tiny, fixed) bit count is already optimal here -- there's no large
+   bitlen loop to speed up, unlike the general bn_mulmod below. */
+static void bn_mulsmall_mod(bn_t *r, const bn_t *a, unsigned k, const bn_mod_t *m) {
     bn_t acc = {0};
     bn_t addend = *a;
     while (k) {
-        if (k & 1) bn_addmod(&acc, &acc, &addend, n);
-        bn_addmod(&addend, &addend, &addend, n);
+        if (k & 1) bn_addmod(&acc, &acc, &addend, m);
+        bn_addmod(&addend, &addend, &addend, m);
         k >>= 1;
     }
     *r = acc;
 }
 
-/* r = (a * b) mod n via double-and-add, given a < n and b < n. */
-static void bn_mulmod(bn_t *r, const bn_t *a_in, const bn_t *b, const bn_t *n) {
-    bn_t result = {0}; /* zero */
-    bn_t a = *a_in;
-    int bitlen = bn_bitlen(b);
-    for (int i = 0; i < bitlen; i++) {
-        int limb_idx = i / 32, bit_idx = i % 32;
-        if (limb_idx < b->n && ((b->limb[limb_idx] >> bit_idx) & 1)) bn_addmod(&result, &result, &a, n);
-        bn_addmod(&a, &a, &a, n); /* a = 2a mod n */
+/* Raw (non-modular) schoolbook multiply: a->n * b->n limb-by-limb
+   long multiplication, same algorithm you'd do by hand in base 2^32
+   instead of base 10. out[] must be zeroed and have room for at least
+   a->n + b->n limbs. O(a->n * b->n) word-multiplies -- the thing the old
+   bn_mulmod's double-and-add avoided needing, at the cost of being far
+   slower than this for anything beyond a handful of bits. */
+static void bn_mul_raw(u32 *out, const bn_t *a, const bn_t *b) {
+    for (int i = 0; i < a->n; i++) {
+        u64 carry = 0;
+        for (int j = 0; j < b->n; j++) {
+            u64 s = (u64)out[i + j] + (u64)a->limb[i] * (u64)b->limb[j] + carry;
+            out[i + j] = (u32)s;
+            carry = s >> 32;
+        }
+        int k = i + b->n;
+        while (carry) { u64 s = (u64)out[k] + carry; out[k] = (u32)s; carry = s >> 32; k++; }
     }
+}
+
+/* Barrett reduction (Handbook of Applied Cryptography, 14.42): reduces a
+   raw product (as produced by bn_mul_raw, up to 2k limbs, value < n^2)
+   mod n using the mu bn_mod_init precomputed. Two more raw multiplies
+   plus a couple of subtracts -- O(k^2) -- replaces what used to be an
+   O(bitlen) loop of modular doublings. */
+static void bn_barrett_reduce(bn_t *r, const u32 *prod, int prod_limbs, const bn_mod_t *m) {
+    int k = m->n.n;
+
+    int q1_limbs = prod_limbs - (k - 1); if (q1_limbs < 0) q1_limbs = 0;
+    bn_t q1; bn_from_limbs(&q1, q1_limbs ? prod + (k - 1) : prod, q1_limbs);
+
+    /* bn_mul_raw only ever touches out[0 .. a->n+b->n-1] (a product of an
+       a->n-limb and b->n-limb number can never need more limbs than that),
+       so that's all that needs zeroing first -- not the full worst-case
+       buffer capacity. For a P-256 field multiply that's the difference
+       between zeroing ~9 limbs and zeroing 260 of them, and this runs on
+       the order of thousands of times per ECDSA verify. */
+    u32 q2[2 * BN_MAX_LIMBS];
+    memset(q2, 0, (size_t)(q1.n + m->mu.n) * sizeof(u32));
+    bn_mul_raw(q2, &q1, &m->mu);
+    int q2_limbs = q1.n + m->mu.n;
+    int q3_limbs = q2_limbs - (k + 1); if (q3_limbs < 0) q3_limbs = 0;
+    bn_t q3; bn_from_limbs(&q3, q3_limbs ? q2 + (k + 1) : q2, q3_limbs);
+
+    bn_t r1; bn_from_limbs(&r1, prod, prod_limbs < k + 1 ? prod_limbs : k + 1);
+
+    u32 r2raw[2 * BN_MAX_LIMBS];
+    memset(r2raw, 0, (size_t)(q3.n + m->n.n) * sizeof(u32));
+    bn_mul_raw(r2raw, &q3, &m->n);
+    int r2_limbs = q3.n + m->n.n;
+    bn_t r2; bn_from_limbs(&r2, r2raw, r2_limbs < k + 1 ? r2_limbs : k + 1);
+
+    bn_t result;
+    if (bn_cmp(&r1, &r2) < 0) {
+        bn_t base_k1 = {0}; base_k1.limb[k + 1] = 1; base_k1.n = k + 2; /* b^(k+1) */
+        bn_t tmp; bn_add(&tmp, &r1, &base_k1);
+        bn_sub(&result, &tmp, &r2);
+    } else {
+        bn_sub(&result, &r1, &r2);
+    }
+    /* Barrett's approximation can leave the result up to a couple of n's
+       too high; a couple of conditional subtracts always finishes the
+       job (proven bound: at most 2 for this variant). */
+    while (bn_cmp(&result, &m->n) >= 0) bn_sub(&result, &result, &m->n);
     *r = result;
+}
+
+/* r = (a * b) mod n, given a < n and b < n. */
+static void bn_mulmod(bn_t *r, const bn_t *a, const bn_t *b, const bn_mod_t *m) {
+    u32 prod[2 * BN_MAX_LIMBS];
+    memset(prod, 0, (size_t)(a->n + b->n) * sizeof(u32)); /* see bn_barrett_reduce's q2/r2raw comment */
+    bn_mul_raw(prod, a, b);
+    bn_barrett_reduce(r, prod, a->n + b->n, m);
 }
 
 /* r = base^exp mod n, base < n required (true for an RSA signature s, which
    is only valid if 0 <= s < n in the first place -- see the s>=n check at
-   each call site, which rejects rather than trying to cope). */
+   each call site, which rejects rather than trying to cope).
+   Builds its own Barrett context from n once, up front, and reuses it for
+   every squaring/multiply below -- callers just pass a plain bn_t modulus,
+   same as before this file's bn_mulmod started needing one. */
 static void bn_modexp(bn_t *r, const bn_t *base, const bn_t *exp, const bn_t *n) {
+    bn_mod_t m; bn_mod_init(&m, n);
     bn_t result = {0}; result.limb[0] = 1; result.n = 1; /* result = 1 */
     int bitlen = bn_bitlen(exp);
     for (int i = bitlen - 1; i >= 0; i--) {
-        bn_mulmod(&result, &result, &result, n); /* square */
+        bn_mulmod(&result, &result, &result, &m); /* square */
         int limb_idx = i / 32, bit_idx = i % 32;
-        if ((exp->limb[limb_idx] >> bit_idx) & 1) bn_mulmod(&result, &result, base, n); /* multiply */
+        if ((exp->limb[limb_idx] >> bit_idx) & 1) bn_mulmod(&result, &result, base, &m); /* multiply */
     }
     *r = result;
 }
 
+/* Only ever called on this file's own hard-coded hex constants below (the
+   P-256/P-384 curve parameters) -- never on external input -- so a strict
+   0-9/A-F decoder with no error path is fine; sscanf("%2hhx", ...) would
+   do the same thing but drags the whole scanf format-string engine into
+   the binary just for this. */
+static u8 hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return (u8)(c - '0');
+    return (u8)((c | 0x20) - 'a' + 10); /* 'A'-'F' or 'a'-'f' */
+}
 static void bn_from_hex(bn_t *r, const char *hex) {
     u8 bytes[64]; size_t n = strlen(hex) / 2;
-    for (size_t i = 0; i < n; i++) sscanf(hex + 2*i, "%2hhx", &bytes[i]);
+    for (size_t i = 0; i < n; i++) bytes[i] = (u8)((hex_nibble(hex[2*i]) << 4) | hex_nibble(hex[2*i+1]));
     bn_from_be(r, bytes, n);
 }
 
@@ -461,7 +590,7 @@ static void jpoint_from_affine(jpoint_t *p, const bn_t *x, const bn_t *y) {
 }
 
 /* Jacobian doubling, a=-3 optimized form (EFD "dbl-2001-b"). */
-static void jpoint_double(jpoint_t *r, const jpoint_t *p, const bn_t *prime) {
+static void jpoint_double(jpoint_t *r, const jpoint_t *p, const bn_mod_t *prime) {
     if (jpoint_is_infinity(p) || p->Y.n == 0) { jpoint_set_infinity(r); return; }
     bn_t delta, gamma, beta, alpha, t1, t2, t3, x3, y3, z3;
     bn_mulmod(&delta, &p->Z, &p->Z, prime);
@@ -489,7 +618,7 @@ static void jpoint_double(jpoint_t *r, const jpoint_t *p, const bn_t *prime) {
 
 /* General Jacobian addition (EFD "add-2007-bl"), with the standard
    same-point (-> double) and P+(-P) (-> infinity) special cases. */
-static void jpoint_add(jpoint_t *r, const jpoint_t *p1, const jpoint_t *p2, const bn_t *prime) {
+static void jpoint_add(jpoint_t *r, const jpoint_t *p1, const jpoint_t *p2, const bn_mod_t *prime) {
     if (jpoint_is_infinity(p1)) { *r = *p2; return; }
     if (jpoint_is_infinity(p2)) { *r = *p1; return; }
     bn_t Z1Z1, Z2Z2, U1, U2, S1, S2, H, I, J, rr, V, t1, t2, t3, t4, X3, Y3, Z3;
@@ -530,7 +659,7 @@ static void jpoint_add(jpoint_t *r, const jpoint_t *p1, const jpoint_t *p2, cons
     r->X = X3; r->Y = Y3; r->Z = Z3;
 }
 
-static void jpoint_scalar_mult(jpoint_t *r, const jpoint_t *p, const bn_t *k, const bn_t *prime) {
+static void jpoint_scalar_mult(jpoint_t *r, const jpoint_t *p, const bn_t *k, const bn_mod_t *prime) {
     jpoint_t result; jpoint_set_infinity(&result);
     int bitlen = bn_bitlen(k);
     for (int i = bitlen - 1; i >= 0; i--) {
@@ -544,11 +673,11 @@ static void jpoint_scalar_mult(jpoint_t *r, const jpoint_t *p, const bn_t *k, co
 /* Converts back to affine via a single Fermat inversion (Z^(p-2) mod p --
    valid since p is prime and Z != 0 here). Returns 0 for the point at
    infinity (no affine representation). */
-static int jpoint_to_affine(bn_t *x, bn_t *y, const jpoint_t *p, const bn_t *prime) {
+static int jpoint_to_affine(bn_t *x, bn_t *y, const jpoint_t *p, const bn_mod_t *prime) {
     if (jpoint_is_infinity(p)) return 0;
     bn_t two = {0}; two.limb[0] = 2; two.n = 1;
-    bn_t pm2; bn_sub(&pm2, prime, &two);
-    bn_t zinv; bn_modexp(&zinv, &p->Z, &pm2, prime);
+    bn_t pm2; bn_sub(&pm2, &prime->n, &two);
+    bn_t zinv; bn_modexp(&zinv, &p->Z, &pm2, &prime->n);
     bn_t zinv2; bn_mulmod(&zinv2, &zinv, &zinv, prime);
     bn_t zinv3; bn_mulmod(&zinv3, &zinv2, &zinv, prime);
     bn_mulmod(x, &p->X, &zinv2, prime);
@@ -632,6 +761,14 @@ static void ecdsa_bits2int(bn_t *e, const u8 *hash, size_t hashlen, int order_by
 static int ecdsa_verify(const curve_params_t *curve, const bn_t *qx, const bn_t *qy,
                          const bn_t *rr, const bn_t *ss, const u8 *hash, size_t hashlen) {
     const bn_t *p = &curve->p, *b = &curve->b, *n = &curve->n, *gx = &curve->gx, *gy = &curve->gy;
+    /* Computed once per call and reused for every field/scalar multiply
+       below -- the field prime and the curve order are each reused
+       hundreds of times over the course of one verify (every point
+       double/add during two scalar multiplications, in the field prime's
+       case), so their Barrett contexts are built once here rather than
+       once per multiply. */
+    bn_mod_t fp; bn_mod_init(&fp, p);
+    bn_mod_t ordm; bn_mod_init(&ordm, n);
 
     bn_t one = {0}; one.limb[0] = 1; one.n = 1;
     bn_t nm1; bn_sub(&nm1, n, &one);
@@ -641,34 +778,34 @@ static int ecdsa_verify(const curve_params_t *curve, const bn_t *qx, const bn_t 
     /* reject a public key that isn't actually on the curve -- accepting one
        that isn't would let an attacker smuggle a point in a weaker group */
     { bn_t x2, x3, ax, y2, rhs;
-      bn_mulmod(&x2, qx, qx, p);
-      bn_mulmod(&x3, &x2, qx, p);
-      bn_mulsmall_mod(&ax, qx, 3, p);          /* a = -3, so a*x = -3x */
-      bn_submod(&rhs, &x3, &ax, p);
-      bn_addmod(&rhs, &rhs, b, p);
-      bn_mulmod(&y2, qy, qy, p);
+      bn_mulmod(&x2, qx, qx, &fp);
+      bn_mulmod(&x3, &x2, qx, &fp);
+      bn_mulsmall_mod(&ax, qx, 3, &fp);          /* a = -3, so a*x = -3x */
+      bn_submod(&rhs, &x3, &ax, &fp);
+      bn_addmod(&rhs, &rhs, b, &fp);
+      bn_mulmod(&y2, qy, qy, &fp);
       if (bn_cmp(&y2, &rhs) != 0) return 0;
     }
 
     bn_t e; ecdsa_bits2int(&e, hash, hashlen, bn_bitlen(n) / 8);
-    if (bn_cmp(&e, n) >= 0) bn_submod(&e, &e, n, n); /* reduce mod n in the (rare) case e>=n; e<2n always so one subtract suffices */
+    if (bn_cmp(&e, n) >= 0) bn_submod(&e, &e, n, &ordm); /* reduce mod n in the (rare) case e>=n; e<2n always so one subtract suffices */
 
     bn_t nm2; bn_t two = {0}; two.limb[0]=2; two.n=1; bn_sub(&nm2, n, &two);
     bn_t w; bn_modexp(&w, ss, &nm2, n); /* w = s^-1 mod n, via Fermat (n is prime) */
-    bn_t u1; bn_mulmod(&u1, &e, &w, n);
-    bn_t u2; bn_mulmod(&u2, rr, &w, n);
+    bn_t u1; bn_mulmod(&u1, &e, &w, &ordm);
+    bn_t u2; bn_mulmod(&u2, rr, &w, &ordm);
 
     jpoint_t G, Q, P1, P2, R;
     jpoint_from_affine(&G, gx, gy);
     jpoint_from_affine(&Q, qx, qy);
-    jpoint_scalar_mult(&P1, &G, &u1, p);
-    jpoint_scalar_mult(&P2, &Q, &u2, p);
-    jpoint_add(&R, &P1, &P2, p);
+    jpoint_scalar_mult(&P1, &G, &u1, &fp);
+    jpoint_scalar_mult(&P2, &Q, &u2, &fp);
+    jpoint_add(&R, &P1, &P2, &fp);
 
     bn_t x1, y1;
-    if (!jpoint_to_affine(&x1, &y1, &R, p)) return 0; /* infinity -- invalid signature */
+    if (!jpoint_to_affine(&x1, &y1, &R, &fp)) return 0; /* infinity -- invalid signature */
     bn_t v;
-    if (bn_cmp(&x1, n) >= 0) bn_submod(&v, &x1, n, n); else v = x1;
+    if (bn_cmp(&x1, n) >= 0) bn_submod(&v, &x1, n, &ordm); else v = x1;
     return bn_cmp(&v, rr) == 0;
 }
 

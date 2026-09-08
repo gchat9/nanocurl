@@ -24,6 +24,8 @@
  * Run: ./run.sh
  */
 #define NANOCURL_VERIFY_NO_MAIN
+#include <stdio.h> /* this test file's own printf/fopen/etc. -- nanocurl-verify.c
+                      itself no longer pulls this in (see strlite.h) */
 #include "../nanocurl-verify.c"
 
 static int failures = 0;
@@ -33,7 +35,7 @@ static int failures = 0;
     else { printf("  FAIL %s\n", desc); failures++; } \
 } while (0)
 
-static int jpoint_eq_affine(const jpoint_t *p, const bn_t *ex, const bn_t *ey, const bn_t *prime) {
+static int jpoint_eq_affine(const jpoint_t *p, const bn_t *ex, const bn_t *ey, const bn_mod_t *prime) {
     bn_t x, y;
     if (!jpoint_to_affine(&x, &y, p, prime)) return 0;
     return bn_cmp(&x, ex) == 0 && bn_cmp(&y, ey) == 0;
@@ -41,48 +43,49 @@ static int jpoint_eq_affine(const jpoint_t *p, const bn_t *ex, const bn_t *ey, c
 
 static void test_curve_properties(const char *name, const curve_params_t *curve) {
     printf("%s group arithmetic (property-based, no external reference):\n", name);
-    const bn_t *p = &curve->p, *b = &curve->b, *n = &curve->n, *gx = &curve->gx, *gy = &curve->gy;
+    const bn_t *b = &curve->b, *n = &curve->n, *gx = &curve->gx, *gy = &curve->gy;
+    bn_mod_t p; bn_mod_init(&p, &curve->p);
 
     /* the generator must actually be on the curve: y^2 == x^3 - 3x + b */
     { bn_t x2, x3, ax, y2, rhs;
-      bn_mulmod(&x2, gx, gx, p);
-      bn_mulmod(&x3, &x2, gx, p);
-      bn_mulsmall_mod(&ax, gx, 3, p);
-      bn_submod(&rhs, &x3, &ax, p);
-      bn_addmod(&rhs, &rhs, b, p);
-      bn_mulmod(&y2, gy, gy, p);
+      bn_mulmod(&x2, gx, gx, &p);
+      bn_mulmod(&x3, &x2, gx, &p);
+      bn_mulsmall_mod(&ax, gx, 3, &p);
+      bn_submod(&rhs, &x3, &ax, &p);
+      bn_addmod(&rhs, &rhs, b, &p);
+      bn_mulmod(&y2, gy, gy, &p);
       CHECK(bn_cmp(&y2, &rhs) == 0, "generator point G satisfies the curve equation");
     }
 
     jpoint_t G, G2_dbl, G2_add, Ginf;
     jpoint_from_affine(&G, gx, gy);
 
-    jpoint_double(&G2_dbl, &G, p);
-    jpoint_add(&G2_add, &G, &G, p);
+    jpoint_double(&G2_dbl, &G, &p);
+    jpoint_add(&G2_add, &G, &G, &p);
     { bn_t x1,y1,x2,y2;
-      int ok1 = jpoint_to_affine(&x1,&y1,&G2_dbl,p);
-      int ok2 = jpoint_to_affine(&x2,&y2,&G2_add,p);
+      int ok1 = jpoint_to_affine(&x1,&y1,&G2_dbl,&p);
+      int ok2 = jpoint_to_affine(&x2,&y2,&G2_add,&p);
       CHECK(ok1 && ok2 && bn_cmp(&x1,&x2)==0 && bn_cmp(&y1,&y2)==0,
             "doubling formula agrees with addition formula (2G == G+G)");
     }
 
     jpoint_set_infinity(&Ginf);
     jpoint_t sum;
-    jpoint_add(&sum, &G, &Ginf, p);
-    CHECK(jpoint_eq_affine(&sum, gx, gy, p), "G + infinity == G");
+    jpoint_add(&sum, &G, &Ginf, &p);
+    CHECK(jpoint_eq_affine(&sum, gx, gy, &p), "G + infinity == G");
 
     jpoint_t nG;
-    jpoint_scalar_mult(&nG, &G, n, p);
+    jpoint_scalar_mult(&nG, &G, n, &p);
     CHECK(jpoint_is_infinity(&nG), "n*G == point at infinity (G has order n)");
 
     jpoint_t threeG_direct, threeG_addadd;
     bn_t three = {0}; three.limb[0] = 3; three.n = 1;
-    jpoint_scalar_mult(&threeG_direct, &G, &three, p);
-    jpoint_t twoG; jpoint_double(&twoG, &G, p);
-    jpoint_add(&threeG_addadd, &twoG, &G, p);
+    jpoint_scalar_mult(&threeG_direct, &G, &three, &p);
+    jpoint_t twoG; jpoint_double(&twoG, &G, &p);
+    jpoint_add(&threeG_addadd, &twoG, &G, &p);
     { bn_t x1,y1,x2,y2;
-      int ok1 = jpoint_to_affine(&x1,&y1,&threeG_direct,p);
-      int ok2 = jpoint_to_affine(&x2,&y2,&threeG_addadd,p);
+      int ok1 = jpoint_to_affine(&x1,&y1,&threeG_direct,&p);
+      int ok2 = jpoint_to_affine(&x2,&y2,&threeG_addadd,&p);
       CHECK(ok1 && ok2 && bn_cmp(&x1,&x2)==0 && bn_cmp(&y1,&y2)==0,
             "scalar_mult(3, G) == double(G) + G");
     }

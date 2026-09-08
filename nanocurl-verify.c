@@ -36,7 +36,9 @@
  *
  * Install: put the resulting binary on $PATH (nanocurl execlp()s it by name).
  */
-#include <stdio.h>
+#define _POSIX_C_SOURCE 199309L /* clock_gettime()/CLOCK_MONOTONIC, needed only
+                                    under NANOCURL_VERIFY_PROFILE below, but
+                                    must be defined before any system header */
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -44,8 +46,11 @@
 #include <errno.h>
 #include <time.h>
 #include <ctype.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #ifdef NANOCURL_VERIFY_WITH_OPENSSL
+#include <stdio.h> /* only the OpenSSL-audit build's [selfcheck] fprintf()s need this */
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <openssl/pem.h>
@@ -53,8 +58,30 @@
 #include <openssl/err.h>
 #endif /* NANOCURL_VERIFY_WITH_OPENSSL */
 
+#include "strlite.h"
 #include "crypto/sha256.h"
 #include "crypto/der.h"
+
+/* ======================================================================
+ * Opt-in instrumentation -- compile with -DNANOCURL_VERIFY_PROFILE to
+ * get some timings printed to stderr
+ * ==================================================================== */
+#ifdef NANOCURL_VERIFY_PROFILE
+#include <stdio.h>
+static struct timespec prof_t0;
+static void prof_start(void) { clock_gettime(CLOCK_MONOTONIC, &prof_t0); }
+static void prof_mark(const char *label) {
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    double ms = (now.tv_sec - prof_t0.tv_sec) * 1000.0 + (now.tv_nsec - prof_t0.tv_nsec) / 1e6;
+    fprintf(stderr, "[profile] %-42s %9.2f ms (cumulative)\n", label, ms);
+}
+#define PROF_START() prof_start()
+#define PROF_MARK(label) prof_mark(label)
+#else
+#define PROF_START() ((void)0)
+#define PROF_MARK(label) ((void)0)
+#endif
+
 #include "crypto/pki_crypto.h"
 
 #define MAX_HOST_LEN   255
@@ -65,15 +92,13 @@
 /* --- stdin reader: exits with a clear message on short read / oversized field.
    Every field here has a hard cap (above) checked before we allocate or read
    it, so a truncated or adversarial request from nanocurl's side can't make
-   us read/allocate something unbounded. (In this design nanocurl is trusted
-   -- it's our own parent process, not the network -- but the cert *bytes*
-   nanocurl forwards originated on the network, so those get no such trust.) */
+   us read/allocate something unbounded.a */
 static void rd_all(void *buf, size_t n) {
     u8 *p = buf; size_t off = 0;
     while (off < n) {
         ssize_t r = read(0, p+off, n-off);
-        if (r < 0) { fprintf(stderr, "nanocurl-verify: read: %s\n", strerror(errno)); exit(2); }
-        if (r == 0) { fprintf(stderr, "nanocurl-verify: unexpected EOF from nanocurl\n"); exit(2); }
+        if (r < 0) { wrs(2, "nanocurl-verify: read: ", errname(errno), "\n", WR_END); exit(2); }
+        if (r == 0) { wrs(2, "nanocurl-verify: unexpected EOF from nanocurl\n", WR_END); exit(2); }
         off += (size_t)r;
     }
 }
@@ -99,39 +124,32 @@ static size_t build_signed_content(const u8 transcript_hash[32], u8 *out) {
  *
  * This section parses raw certificate DER directly, with zero calls into
  * libcrypto, to independently derive two of the checks a TLS client needs:
- * hostname match and validity window. It's authoritative by default (see
- * the file-level comment); der_read_tlv() itself, along with the RSA/ECDSA
- * primitives this section builds on, now lives in crypto/der.h and
- * crypto/pki_crypto.h -- what's left here is specifically X.509 structure
- * (TBSCertificate fields, extensions, name matching), not a crypto
- * primitive in its own right.
+ * hostname match and validity window.
  *
  * Every parsing step below fails closed: a length that doesn't fit, an
  * unsupported encoding, or a structure that doesn't match expectations
- * aborts *that* parse, never a crash and never a silent pass. This is the
- * code most exposed to attacker-controlled bytes in the whole project, so
- * treat every returned 0 here as "reject and move on", not something to
- * work around.
+ * aborts *that* parse. This is the code most exposed to attacker-controlled
+ * bytes in the whole project, treat with care.
  * ==================================================================== */
 
 /* Howard Hinnant's civil_from_days, used instead of glibc's timegm() so this
    has no libc-extension dependency and no 2038-adjacent surprises on odd
-   platforms -- also just more in keeping with "hand-rolled". */
-static time_t asn1_civil_to_unix(int y, int m, int d, int hh, int mm, int ss) {
+   platforms */
+static int64_t asn1_civil_to_unix(int y, int m, int d, int hh, int mm, int ss) {
     y -= (m <= 2);
     long long era = (y >= 0 ? y : y - 399) / 400;
     unsigned yoe = (unsigned)(y - era * 400);
     unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
     unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     long long days = era * 146097 + (long long)doe - 719468;
-    return (time_t)(days * 86400LL + hh * 3600 + mm * 60 + ss);
+    return (int64_t)(days * 86400LL + hh * 3600 + mm * 60 + ss);
 }
 
 /* Parses a UTCTime ("YYMMDDHHMMSSZ") or GeneralizedTime ("YYYYMMDDHHMMSSZ")
    value. Only the Zulu, seconds-included form is accepted -- DER requires
    it, and any other form (fractional seconds, explicit offsets) is a
    non-DER encoding we'd rather reject than mis-parse. */
-static int parse_asn1_time(int is_utc, const u8 *s, size_t len, time_t *out) {
+static int parse_asn1_time(int is_utc, const u8 *s, size_t len, int64_t *out) {
     size_t need = is_utc ? 13 : 15;
     if (len != need) return 0;
     for (size_t i = 0; i < need - 1; i++) if (!isdigit(s[i])) return 0;
@@ -231,12 +249,7 @@ static int extract_common_name(const u8 *p, size_t len, char *out, size_t outsz)
    valid right now, for this hostname" -- notBefore/notAfter and SAN/CN.
    Returns 1 (checks pass), 0 (checks fail, *reason set), or -1 (couldn't
    parse this certificate's shape at all, *reason set to why -- treated by
-   the caller as inconclusive, not as a pass or a fail). */
-/* The repeated prefix-skipping logic for reaching TBSCertificate's fields
-   was previously duplicated wherever it was needed; that's exactly the kind
-   of copy-paste drift that produces subtle bugs, so it's centralized here
-   once and reused everywhere (currently: hostname/validity checks and RSA
-   key extraction; more fields will lean on this as later phases land). */
+   the caller as inconclusive */
 typedef struct {
     der_tlv_t serial, sigalg, issuer, validity, subject, spki;
     der_reader_t rest; /* positioned right after spki: [1]/[2] uniqueIDs, then [3] extensions */
@@ -263,16 +276,16 @@ static int walk_tbs_prefix(const u8 *der, size_t derlen, tbs_fields_t *out) {
 static int handrolled_check_leaf(const u8 *der, size_t derlen, const char *host,
                                   char *reason, size_t reasonsz) {
     tbs_fields_t tf;
-    if (!walk_tbs_prefix(der, derlen, &tf)) { snprintf(reason, reasonsz, "could not parse TBSCertificate prefix"); return -1; }
+    if (!walk_tbs_prefix(der, derlen, &tf)) { scopy(reason, reasonsz, "could not parse TBSCertificate prefix"); return -1; }
 
-    time_t not_before, not_after;
+    int64_t not_before, not_after;
     {
         der_reader_t vr = { tf.validity.value, tf.validity.value + tf.validity.len };
         der_tlv_t t1, t2;
-        if (!der_read_tlv(&vr, &t1) || (t1.tag != 0x17 && t1.tag != 0x18)) { snprintf(reason, reasonsz, "bad notBefore"); return -1; }
-        if (!parse_asn1_time(t1.tag == 0x17, t1.value, t1.len, &not_before)) { snprintf(reason, reasonsz, "unparseable notBefore"); return -1; }
-        if (!der_read_tlv(&vr, &t2) || (t2.tag != 0x17 && t2.tag != 0x18)) { snprintf(reason, reasonsz, "bad notAfter"); return -1; }
-        if (!parse_asn1_time(t2.tag == 0x17, t2.value, t2.len, &not_after)) { snprintf(reason, reasonsz, "unparseable notAfter"); return -1; }
+        if (!der_read_tlv(&vr, &t1) || (t1.tag != 0x17 && t1.tag != 0x18)) { scopy(reason, reasonsz, "bad notBefore"); return -1; }
+        if (!parse_asn1_time(t1.tag == 0x17, t1.value, t1.len, &not_before)) { scopy(reason, reasonsz, "unparseable notBefore"); return -1; }
+        if (!der_read_tlv(&vr, &t2) || (t2.tag != 0x17 && t2.tag != 0x18)) { scopy(reason, reasonsz, "bad notAfter"); return -1; }
+        if (!parse_asn1_time(t2.tag == 0x17, t2.value, t2.len, &not_after)) { scopy(reason, reasonsz, "unparseable notAfter"); return -1; }
     }
 
     char cn[256] = {0};
@@ -308,16 +321,18 @@ static int handrolled_check_leaf(const u8 *der, size_t derlen, const char *host,
     }
 
     int name_ok = san_present ? san_ok : (have_cn && hostname_matches(cn, strlen(cn), host));
-    time_t now = time(NULL);
+    int64_t now = (int64_t)time(NULL);
     int time_ok = now >= not_before && now <= not_after;
 
     if (!name_ok) {
-        snprintf(reason, reasonsz, "hostname does not match %s",
-                 san_present ? "any SAN entry" : (have_cn ? "the subject CN" : "any name in the certificate (no SAN, no CN)"));
+        size_t off = cat(reason, reasonsz, 0, "hostname does not match ");
+        off = cat(reason, reasonsz, off,
+                   san_present ? "any SAN entry" : (have_cn ? "the subject CN" : "any name in the certificate (no SAN, no CN)"));
+        reason[off < reasonsz ? off : reasonsz - 1] = '\0';
         return 0;
     }
     if (!time_ok) {
-        snprintf(reason, reasonsz, "%s", now < not_before ? "certificate is not yet valid" : "certificate has expired");
+        scopy(reason, reasonsz, now < not_before ? "certificate is not yet valid" : "certificate has expired");
         return 0;
     }
     return 1;
@@ -389,31 +404,36 @@ static int handrolled_verify_certverify(const u8 *leaf_der, size_t leaf_der_len,
     if (sigalg == 0x0401 || sigalg == 0x0804) {
         bn_t n, e;
         if (!extract_rsa_pubkey(leaf_der, leaf_der_len, &n, &e)) {
-            snprintf(reason, reasonsz, "leaf key is not RSA (or SPKI didn't parse)");
+            scopy(reason, reasonsz, "leaf key is not RSA (or SPKI didn't parse)");
             return -1;
         }
         int ok = (sigalg == 0x0401) ? rsa_pkcs1_verify(&n, &e, sig, siglen, hash)
                                      : rsa_pss_verify(&n, &e, sig, siglen, hash);
-        if (!ok) snprintf(reason, reasonsz, "signature does not verify");
+        if (!ok) scopy(reason, reasonsz, "signature does not verify");
         return ok;
     }
     if (sigalg == 0x0403) {
         curve_params_t curve;
         bn_t qx, qy;
         if (!extract_ec_pubkey(leaf_der, leaf_der_len, &curve, &qx, &qy) || curve.id != EC_CURVE_P256) {
-            snprintf(reason, reasonsz, "leaf key is not a P-256 EC key (or SPKI didn't parse)");
+            scopy(reason, reasonsz, "leaf key is not a P-256 EC key (or SPKI didn't parse)");
             return -1;
         }
         bn_t r, s;
         if (!parse_ecdsa_sig(sig, siglen, &r, &s)) {
-            snprintf(reason, reasonsz, "malformed ECDSA-Sig-Value");
+            scopy(reason, reasonsz, "malformed ECDSA-Sig-Value");
             return -1;
         }
         int ok = ecdsa_verify(&curve, &qx, &qy, &r, &s, hash, sizeof hash);
-        if (!ok) snprintf(reason, reasonsz, "signature does not verify");
+        if (!ok) scopy(reason, reasonsz, "signature does not verify");
         return ok;
     }
-    snprintf(reason, reasonsz, "sigalg 0x%04zx not hand-rolled yet", sigalg);
+    {
+        size_t off = cat(reason, reasonsz, 0, "sigalg ");
+        off = cat(reason, reasonsz, off, u16hex((unsigned)sigalg));
+        off = cat(reason, reasonsz, off, " not hand-rolled yet");
+        reason[off < reasonsz ? off : reasonsz - 1] = '\0';
+    }
     return -1;
 }
 
@@ -488,9 +508,8 @@ static long b64_decode(const char *in, size_t inlen, u8 *out, size_t outcap) {
 /* Finds the next "-----BEGIN CERTIFICATE-----"..."-----END CERTIFICATE-----"
    block at or after `p` and decodes it into `out`. Returns a pointer just
    past the END line (for the next search), or NULL once no more blocks are
-   found. Non-certificate PEM blocks (private keys, etc. -- not expected in
-   a CA bundle, but a defensively-written scan skips them either way by
-   simply not matching the marker) are naturally skipped by the search. */
+   found. Non-certificate PEM blocks and other detritus is naturally skipped
+   by the search. */
 static const char *pem_next_cert(const char *p, const char *end, u8 *out, size_t outcap, size_t *outlen) {
     static const char *BEGIN = "-----BEGIN CERTIFICATE-----";
     static const char *ENDM  = "-----END CERTIFICATE-----";
@@ -531,18 +550,27 @@ static const char *TRUST_STORE_CANDIDATE_PATHS[] = {
    bytes are allocated here and deliberately never freed -- trust_anchor_t
    entries point directly into them, they need to live for the process's
    entire (one-shot, short) lifetime, and the OS reclaims them at exit
-   anyway. Returns 1 on success (individual unparseable certs are just
-   skipped, not fatal), 0 if no bundle file could be opened at all. */
+   anyway. Returns 1 on success (at least one certificate loaded), and
+   0 otherwise (fail) */
 static int load_trust_store_from_paths(trust_store_t *store, const char *const *paths) {
     store->count = 0;
-    FILE *f = NULL;
-    for (int i = 0; paths[i]; i++) { f = fopen(paths[i], "rb"); if (f) break; }
-    if (!f) return 0;
-    fseek(f, 0, SEEK_END); long fsize = ftell(f); fseek(f, 0, SEEK_SET);
-    if (fsize <= 0 || fsize > 32 * 1024 * 1024) { fclose(f); return 0; } /* sanity cap; real bundles are a few hundred KB */
+    int fd = -1;
+    for (int i = 0; paths[i]; i++) { fd = open(paths[i], O_RDONLY); if (fd >= 0) break; }
+    if (fd < 0) return 0;
+    struct stat st;
+    if (fstat(fd, &st) != 0) { close(fd); return 0; }
+    long fsize = (long)st.st_size;
+    if (fsize <= 0 || fsize > 32 * 1024 * 1024) { close(fd); return 0; } /* sanity cap; real bundles are a few hundred KB */
     u8 *txt = malloc((size_t)fsize);
-    size_t n = txt ? fread(txt, 1, (size_t)fsize, f) : 0;
-    fclose(f);
+    size_t n = 0;
+    if (txt) {
+        while (n < (size_t)fsize) {
+            ssize_t r = read(fd, txt + n, (size_t)fsize - n);
+            if (r <= 0) break;
+            n += (size_t)r;
+        }
+    }
+    close(fd);
     if (!txt || n == 0) return 0;
     u8 *der = malloc((size_t)fsize); /* decoded output is always <= input size */
     if (!der) return 0;
@@ -582,12 +610,12 @@ static int cert_is_currently_valid(const u8 *der, size_t derlen) {
     if (!walk_tbs_prefix(der, derlen, &tf)) return 0;
     der_reader_t vr = { tf.validity.value, tf.validity.value + tf.validity.len };
     der_tlv_t t1, t2;
-    time_t not_before, not_after;
+    int64_t not_before, not_after;
     if (!der_read_tlv(&vr, &t1) || (t1.tag != 0x17 && t1.tag != 0x18)) return 0;
     if (!parse_asn1_time(t1.tag == 0x17, t1.value, t1.len, &not_before)) return 0;
     if (!der_read_tlv(&vr, &t2) || (t2.tag != 0x17 && t2.tag != 0x18)) return 0;
     if (!parse_asn1_time(t2.tag == 0x17, t2.value, t2.len, &not_after)) return 0;
-    time_t now = time(NULL);
+    int64_t now = (int64_t)time(NULL);
     return now >= not_before && now <= not_after;
 }
 
@@ -687,7 +715,7 @@ static const u8 OID_ECDSA_WITH_SHA384[] = {0x2a,0x86,0x48,0xce,0x3d,0x04,0x03,0x
 /* Verifies that `child_der` was signed by `issuer_der`'s public key.
    Returns 1 (verified), 0 (signature doesn't verify, *reason set), or -1
    (child's signature algorithm or issuer's key type isn't hand-rolled yet,
-   *reason set -- inconclusive, not a verdict).
+   *reason set -- inconclusive result).
    The hash algorithm is whatever the child's signatureAlgorithm actually
    specifies (SHA-256 or SHA-384), and the curve is whatever the issuer's
    own key actually is (P-256 or P-384) -- these are independent in
@@ -698,16 +726,16 @@ static int verify_cert_signed_by(const u8 *child_der, size_t child_len, const u8
                                   char *reason, size_t reasonsz) {
     cert_signature_info_t info;
     if (!extract_cert_signature_info(child_der, child_len, &info)) {
-        snprintf(reason, reasonsz, "could not parse certificate's signature fields");
+        scopy(reason, reasonsz, "could not parse certificate's signature fields");
         return -1;
     }
 
     if (info.sigalg_oid_len == sizeof(OID_SHA256_WITH_RSA) && memcmp(info.sigalg_oid, OID_SHA256_WITH_RSA, info.sigalg_oid_len) == 0) {
         u8 hash[32]; sha256_oneshot(info.tbs_raw, info.tbs_raw_len, hash);
         bn_t n, e;
-        if (!extract_rsa_pubkey(issuer_der, issuer_len, &n, &e)) { snprintf(reason, reasonsz, "issuer key is not RSA (or didn't parse)"); return -1; }
+        if (!extract_rsa_pubkey(issuer_der, issuer_len, &n, &e)) { scopy(reason, reasonsz, "issuer key is not RSA (or didn't parse)"); return -1; }
         int ok = rsa_pkcs1_verify(&n, &e, info.sig, info.sig_len, hash);
-        if (!ok) snprintf(reason, reasonsz, "RSA signature does not verify");
+        if (!ok) scopy(reason, reasonsz, "RSA signature does not verify");
         return ok;
     }
     if ((info.sigalg_oid_len == sizeof(OID_ECDSA_WITH_SHA256) && memcmp(info.sigalg_oid, OID_ECDSA_WITH_SHA256, info.sigalg_oid_len) == 0) ||
@@ -718,14 +746,14 @@ static int verify_cert_signed_by(const u8 *child_der, size_t child_len, const u8
         else sha256_oneshot(info.tbs_raw, info.tbs_raw_len, hash);
         curve_params_t curve;
         bn_t qx, qy;
-        if (!extract_ec_pubkey(issuer_der, issuer_len, &curve, &qx, &qy)) { snprintf(reason, reasonsz, "issuer key is not an EC key on a supported curve (or didn't parse)"); return -1; }
+        if (!extract_ec_pubkey(issuer_der, issuer_len, &curve, &qx, &qy)) { scopy(reason, reasonsz, "issuer key is not an EC key on a supported curve (or didn't parse)"); return -1; }
         bn_t r, s;
-        if (!parse_ecdsa_sig(info.sig, info.sig_len, &r, &s)) { snprintf(reason, reasonsz, "malformed ECDSA-Sig-Value"); return -1; }
+        if (!parse_ecdsa_sig(info.sig, info.sig_len, &r, &s)) { scopy(reason, reasonsz, "malformed ECDSA-Sig-Value"); return -1; }
         int ok = ecdsa_verify(&curve, &qx, &qy, &r, &s, hash, hashlen);
-        if (!ok) snprintf(reason, reasonsz, "ECDSA signature does not verify");
+        if (!ok) scopy(reason, reasonsz, "ECDSA signature does not verify");
         return ok;
     }
-    snprintf(reason, reasonsz, "certificate's signature algorithm not hand-rolled yet");
+    scopy(reason, reasonsz, "certificate's signature algorithm not hand-rolled yet");
     return -1;
 }
 
@@ -743,35 +771,48 @@ static int verify_cert_signed_by(const u8 *child_der, size_t child_len, const u8
    inconclusive rather than a verdict). */
 static int handrolled_verify_chain_with_store(const u8 *const *certs, const size_t *cert_lens, int ncerts,
                                                trust_store_t *store, char *reason, size_t reasonsz) {
-    if (ncerts < 1 || ncerts > MAX_CHAIN_CERTS) { snprintf(reason, reasonsz, "unexpected certificate count"); return -1; }
+    if (ncerts < 1 || ncerts > MAX_CHAIN_CERTS) { scopy(reason, reasonsz, "unexpected certificate count"); return -1; }
 
     for (int i = 0; i < ncerts; i++) {
         if (!cert_is_currently_valid(certs[i], cert_lens[i])) {
-            snprintf(reason, reasonsz, "certificate #%d in the chain is expired or not yet valid", i);
+            size_t off = cat(reason, reasonsz, 0, "certificate #");
+            off = cat(reason, reasonsz, off, utoa((unsigned long long)i));
+            off = cat(reason, reasonsz, off, " in the chain is expired or not yet valid");
+            reason[off < reasonsz ? off : reasonsz - 1] = '\0';
             return 0;
         }
     }
-    for (int i = 0; i < ncerts - 1; i++) {
+
+    /* Walk the server-supplied chain from the leaf toward the root, one hop
+       at a time. At EACH certificate, first check whether its own issuer is
+       already a locally trusted root; only if it isn't do we fall back to
+       verifying it against the next certificate the server sent and try
+       again one hop further out. */
+    for (int i = 0; i < ncerts; i++) {
+        tbs_fields_t tf;
+        if (!walk_tbs_prefix(certs[i], cert_lens[i], &tf)) {
+            scopy(reason, reasonsz, "could not parse a certificate in the chain");
+            return -1;
+        }
+        const trust_anchor_t *anchor = find_trust_anchor_by_subject(store, tf.issuer.value, tf.issuer.len);
+        if (anchor) {
+            if (!cert_is_currently_valid(anchor->cert_der, anchor->cert_len)) { scopy(reason, reasonsz, "matching trust anchor is expired or not yet valid"); return 0; }
+            if (!cert_is_valid_ca(anchor->cert_der, anchor->cert_len)) { scopy(reason, reasonsz, "matching trust anchor is not a valid CA"); return 0; }
+            return verify_cert_signed_by(certs[i], cert_lens[i], anchor->cert_der, anchor->cert_len, reason, reasonsz);
+        }
+        if (i + 1 >= ncerts) break; /* no more server-supplied certs left to try */
         if (!cert_is_valid_ca(certs[i+1], cert_lens[i+1])) {
-            snprintf(reason, reasonsz, "certificate #%d is not a valid CA (basicConstraints/keyUsage)", i+1);
+            size_t off = cat(reason, reasonsz, 0, "certificate #");
+            off = cat(reason, reasonsz, off, utoa((unsigned long long)(i+1)));
+            off = cat(reason, reasonsz, off, " is not a valid CA (basicConstraints/keyUsage)");
+            reason[off < reasonsz ? off : reasonsz - 1] = '\0';
             return 0;
         }
         int ok = verify_cert_signed_by(certs[i], cert_lens[i], certs[i+1], cert_lens[i+1], reason, reasonsz);
         if (ok <= 0) return ok;
     }
-
-    tbs_fields_t last_tf;
-    if (!walk_tbs_prefix(certs[ncerts-1], cert_lens[ncerts-1], &last_tf)) {
-        snprintf(reason, reasonsz, "could not parse the last certificate in the chain");
-        return -1;
-    }
-    const trust_anchor_t *anchor = find_trust_anchor_by_subject(store, last_tf.issuer.value, last_tf.issuer.len);
-    if (!anchor) { snprintf(reason, reasonsz, "issuer of the last certificate in the chain is not in the trust store"); return 0; }
-    if (!cert_is_currently_valid(anchor->cert_der, anchor->cert_len)) { snprintf(reason, reasonsz, "matching trust anchor is expired or not yet valid"); return 0; }
-    if (!cert_is_valid_ca(anchor->cert_der, anchor->cert_len)) { snprintf(reason, reasonsz, "matching trust anchor is not a valid CA"); return 0; }
-    int ok = verify_cert_signed_by(certs[ncerts-1], cert_lens[ncerts-1], anchor->cert_der, anchor->cert_len, reason, reasonsz);
-    if (ok <= 0) return ok;
-    return 1;
+    scopy(reason, reasonsz, "issuer of the last certificate in the chain is not in the trust store");
+    return 0;
 }
 
 static int handrolled_verify_chain(const u8 *const *certs, const size_t *cert_lens, int ncerts,
@@ -779,7 +820,8 @@ static int handrolled_verify_chain(const u8 *const *certs, const size_t *cert_le
     static trust_store_t store;
     static int store_loaded = 0, store_ok = 0;
     if (!store_loaded) { store_ok = load_trust_store(&store); store_loaded = 1; }
-    if (!store_ok) { snprintf(reason, reasonsz, "no system trust store found"); return -1; }
+    PROF_MARK("trust store loaded (read + PEM/DER decode)");
+    if (!store_ok) { scopy(reason, reasonsz, "no system trust store found"); return -1; }
     return handrolled_verify_chain_with_store(certs, cert_lens, ncerts, &store, reason, reasonsz);
 }
 
@@ -922,18 +964,19 @@ static void run_openssl_reference_and_compare(X509 *const *certs, int ncerts, co
 
 #ifndef NANOCURL_VERIFY_NO_MAIN
 int main(void) {
+    PROF_START();
     u8 version = rd_u8();
-    if (version != 1) { fprintf(stderr, "nanocurl-verify: unsupported request version %u\n", version); return 2; }
+    if (version != 1) { wrs(2, "nanocurl-verify: unsupported request version ", utoa(version), "\n", WR_END); return 2; }
 
     size_t hlen = rd_u16();
-    if (hlen == 0 || hlen > MAX_HOST_LEN) { fprintf(stderr, "nanocurl-verify: bad hostname length\n"); return 2; }
+    if (hlen == 0 || hlen > MAX_HOST_LEN) { wrs(2, "nanocurl-verify: bad hostname length\n", WR_END); return 2; }
     char host[MAX_HOST_LEN+1];
     rd_all(host, hlen); host[hlen] = '\0';
 
     size_t sigalg = rd_u16();
 
     size_t siglen = rd_u16();
-    if (siglen == 0 || siglen > MAX_SIG_LEN) { fprintf(stderr, "nanocurl-verify: bad signature length\n"); return 2; }
+    if (siglen == 0 || siglen > MAX_SIG_LEN) { wrs(2, "nanocurl-verify: bad signature length\n", WR_END); return 2; }
     u8 sig[MAX_SIG_LEN];
     rd_all(sig, siglen);
 
@@ -942,7 +985,8 @@ int main(void) {
 
     size_t ncerts = rd_u16();
     if (ncerts == 0 || ncerts > MAX_CERTS) {
-        fprintf(stderr, "nanocurl-verify: server sent %zu certificates (must be 1-%d)\n", ncerts, MAX_CERTS);
+        wrs(2, "nanocurl-verify: server sent ", utoa((unsigned long long)ncerts),
+               " certificates (must be 1-" NANOCURL_STR(MAX_CERTS) ")\n", WR_END);
         return 1;
     }
 
@@ -952,9 +996,9 @@ int main(void) {
 #endif
     for (size_t i = 0; i < ncerts; i++) {
         size_t dl = rd_u24();
-        if (dl == 0 || dl > MAX_CERT_LEN) { fprintf(stderr, "nanocurl-verify: bad certificate length\n"); return 2; }
+        if (dl == 0 || dl > MAX_CERT_LEN) { wrs(2, "nanocurl-verify: bad certificate length\n", WR_END); return 2; }
         u8 *der = malloc(dl);
-        if (!der) { fprintf(stderr, "nanocurl-verify: out of memory\n"); return 2; }
+        if (!der) { wrs(2, "nanocurl-verify: out of memory\n", WR_END); return 2; }
         rd_all(der, dl);
         all_der[i] = der; all_der_len[i] = dl;
 #ifdef NANOCURL_VERIFY_WITH_OPENSSL
@@ -966,16 +1010,20 @@ int main(void) {
 #endif
     }
     u8 *leaf_der = all_der[0]; size_t leaf_der_len = all_der_len[0];
+    PROF_MARK("request read + parsed");
 
     /* --- authoritative checks: entirely hand-rolled, zero libcrypto calls
        in a default build. See the file-level comment for the two things
        this proves and why both are needed. --- */
     char host_reason[128] = {0}, chain_reason[160] = {0}, sig_reason[128] = {0};
     int host_r = handrolled_check_leaf(leaf_der, leaf_der_len, host, host_reason, sizeof host_reason);
+    PROF_MARK("leaf hostname/validity check");
     int chain_r = handrolled_verify_chain((const u8 *const *)all_der, all_der_len, (int)ncerts, chain_reason, sizeof chain_reason);
+    PROF_MARK("chain-of-trust check (sig. verification) done");
     u8 content[64 + 64 + 32];
     size_t clen = build_signed_content(transcript_hash, content);
     int sig_r = handrolled_verify_certverify(leaf_der, leaf_der_len, sigalg, sig, siglen, content, clen, sig_reason, sizeof sig_reason);
+    PROF_MARK("CertificateVerify signature check done");
 
 #ifdef NANOCURL_VERIFY_WITH_OPENSSL
     run_openssl_reference_and_compare(certs, (int)ncerts, host, sigalg, sig, siglen, content, clen,
@@ -989,24 +1037,25 @@ int main(void) {
        support whatever algorithm/curve/structure it hit -- fail closed,
        since "couldn't check" is not the same as "checked out fine". */
     if (host_r != 1) {
-        fprintf(stderr, "nanocurl-verify: certificate verification failed for %s: %s%s\n", host,
-                host_reason[0] ? host_reason : "hostname/validity check failed",
-                host_r < 0 ? " (unsupported by this minimal verifier -- rebuild with -DNANOCURL_VERIFY_WITH_OPENSSL for full algorithm coverage)" : "");
+        wrs(2, "nanocurl-verify: certificate verification failed for ", host, ": ",
+               host_reason[0] ? host_reason : "hostname/validity check failed",
+               host_r < 0 ? " (unsupported by this minimal verifier -- rebuild with -DNANOCURL_VERIFY_WITH_OPENSSL for full algorithm coverage)" : "",
+               "\n", WR_END);
         return 1;
     }
     if (chain_r != 1) {
-        fprintf(stderr, "nanocurl-verify: certificate verification failed for %s: %s%s\n", host,
-                chain_reason[0] ? chain_reason : "chain-of-trust check failed",
-                chain_r < 0 ? " (unsupported by this minimal verifier -- rebuild with -DNANOCURL_VERIFY_WITH_OPENSSL for full algorithm coverage)" : "");
+        wrs(2, "nanocurl-verify: certificate verification failed for ", host, ": ",
+               chain_reason[0] ? chain_reason : "chain-of-trust check failed",
+               chain_r < 0 ? " (unsupported by this minimal verifier -- rebuild with -DNANOCURL_VERIFY_WITH_OPENSSL for full algorithm coverage)" : "",
+               "\n", WR_END);
         return 1;
     }
     if (sig_r != 1) {
-        fprintf(stderr,
-            "nanocurl-verify: CertificateVerify signature check failed for %s (sigalg 0x%04zx)%s -- "
-            "the certificate may be valid but the server could not prove it holds the matching "
-            "private key; this connection may be actively intercepted\n",
-            host, sigalg,
-            sig_r < 0 ? " (algorithm unsupported by this minimal verifier)" : "");
+        wrs(2, "nanocurl-verify: CertificateVerify signature check failed for ", host,
+               " (sigalg ", u16hex((unsigned)sigalg), ")",
+               sig_r < 0 ? " (algorithm unsupported by this minimal verifier)" : "",
+               " -- the certificate may be valid but the server could not prove it holds the matching "
+               "private key; this connection may be actively intercepted\n", WR_END);
         return 1;
     }
     return 0;

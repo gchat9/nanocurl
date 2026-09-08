@@ -17,11 +17,9 @@
  *
  */
 #define _POSIX_C_SOURCE 200809L
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <stdarg.h>
 #include <strings.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -30,6 +28,11 @@
 #include <sys/wait.h>
 #include <netdb.h>
 #include <arpa/inet.h>
+#ifdef __dietlibc__
+#include <linux/random.h> /* getrandom() -- dietlibc declares it here */
+#else
+#include <sys/random.h>   /* getrandom() -- glibc declares it here */
+#endif
 
 typedef uint8_t u8;
 typedef uint32_t u32;
@@ -42,26 +45,13 @@ typedef uint64_t u64;
 #define TLS_MAX_RECORD 16640
 #define BUFSZ (TLS_MAX_RECORD + 128)
 
+#include "strlite.h"
 #include "crypto/sha256.h"
 #include "crypto/handshake_crypto.h"
 
 /* ======================================================================
  * TCP plumbing
  * ==================================================================== */
-
-/* Appends a formatted string to buf at offset off, never writing past bufsz
-   and never returning an offset that could underflow a later bufsz-off. Used
-   to build the HTTP request line-by-line with a variable number of -H
-   headers without worrying about snprintf's truncation-return-value trap. */
-static size_t buf_append(char *buf, size_t bufsz, size_t off, const char *fmt, ...) {
-    if (off >= bufsz) return off;
-    va_list ap; va_start(ap, fmt);
-    int w = vsnprintf(buf + off, bufsz - off, fmt, ap);
-    va_end(ap);
-    if (w < 0) return off;
-    size_t neww = off + (size_t)w;
-    return neww < bufsz ? neww : bufsz;
-}
 
 /* True if `line` is an HTTP header with the name `name` e.g.
    header_name_is("Host: example.com", "Host") -> true.
@@ -76,10 +66,12 @@ static int has_header(const char *const *headers, int n, const char *name) {
     return 0;
 }
 
-static int tcp_connect(const char *host, const char *port) {
+static int tcp_connect(const char *host, const char *port, int ai_family) {
     struct addrinfo hints = {0}, *res;
-    hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host, port, &hints, &res) != 0) { perror("getaddrinfo"); exit(1); }
+    hints.ai_family = ai_family; hints.ai_socktype = SOCK_STREAM;
+    /* getaddrinfo() doesn't set errno on failure, and its own gai_strerror()
+       isn't available on dietlibc, so we don't try to say more than this. */
+    if (getaddrinfo(host, port, &hints, &res) != 0) die("nanocurl: getaddrinfo failed\n", WR_END);
     int fd = -1;
     for (struct addrinfo *p = res; p; p = p->ai_next) {
         fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
@@ -88,7 +80,7 @@ static int tcp_connect(const char *host, const char *port) {
         close(fd); fd = -1;
     }
     freeaddrinfo(res);
-    if (fd < 0) { fprintf(stderr, "connect failed\n"); exit(1); }
+    if (fd < 0) die("connect failed\n", WR_END);
     return fd;
 }
 
@@ -96,7 +88,7 @@ static void send_all(int fd, const u8 *buf, size_t n) {
     size_t off = 0;
     while (off < n) {
         ssize_t w = send(fd, buf+off, n-off, 0);
-        if (w <= 0) { perror("send"); exit(1); }
+        if (w <= 0) die("connection closed / send error\n", WR_END);
         off += w;
     }
 }
@@ -105,7 +97,7 @@ static void recv_all(int fd, u8 *buf, size_t n) {
     size_t off = 0;
     while (off < n) {
         ssize_t r = recv(fd, buf+off, n-off, 0);
-        if (r <= 0) { fprintf(stderr, "connection closed / recv error\n"); exit(1); }
+        if (r <= 0) die("connection closed / recv error\n", WR_END);
         off += r;
     }
 }
@@ -148,8 +140,8 @@ static u8 read_record(tls_t *t, u8 *payload, size_t *paylen, int decrypt) {
     u8 nonce[12]; mk_nonce(nonce, t->s_iv, t->s_seq++);
     u8 plain[BUFSZ];
     int bad = aead_open(t->s_key, nonce, hdr, 5, body, rlen, plain);
-    if (bad) fprintf(stderr, "[warn] record MAC mismatch (seq %llu) -- decoding anyway\n",
-                      (unsigned long long)(t->s_seq-1));
+    if (bad) wrs(2, "[warn] record MAC mismatch (seq ", utoa((unsigned long long)(t->s_seq-1)),
+                 ") -- decoding anyway\n", WR_END);
     size_t plen = rlen - 16;
     while (plen > 0 && plain[plen-1] == 0) plen--; /* strip zero padding */
     u8 inner_type = plain[plen-1];
@@ -183,7 +175,7 @@ static void hs_fill(tls_t *t, int decrypt) {
     for (;;) {
         u8 type = read_record(t, payload, &plen, decrypt);
         if (type == 20) continue; /* change_cipher_spec, skip */
-        if (type == 21) { fprintf(stderr, "TLS alert received, aborting\n"); exit(1); }
+        if (type == 21) die("TLS alert received, aborting\n", WR_END);
         if (type == 22 || type == 24 /* handshake, incl. inner post-decrypt */) {
             memcpy(t->hsbuf+t->hslen, payload, plen);
             t->hslen += plen;
@@ -257,7 +249,7 @@ static void print_tls_alert(const u8 *payload, size_t plen) {
         case 116: name="certificate_required"; break;
         case 120: name="no_application_protocol"; break;
     }
-    fprintf(stderr, "[tls alert] level=%s description=%d (%s)\n", lvl, desc, name);
+    wrs(2, "[tls alert] level=", lvl, " description=", itoa(desc), " (", name, ")\n", WR_END);
 }
 
 /* --- minimal response streamer: pulls decrypted application-data records one
@@ -301,16 +293,16 @@ static int rs_getc(respstream_t *rs) {
     return rs->buf[rs->off++];
 }
 
-/* copy up to n bytes from the stream to `out` (pass NULL to discard them
+/* copy up to n bytes from the stream to fd outfd (pass -1 to discard them
    instead of writing). Returns bytes actually copied, which is less than n
    only once the stream has ended. */
-static size_t rs_copy(respstream_t *rs, FILE *out, size_t n) {
+static size_t rs_copy(respstream_t *rs, int outfd, size_t n) {
     size_t copied = 0;
     while (copied < n) {
         if (rs->off >= rs->len && !rs_fill_one_record(rs)) break;
         size_t avail = rs->len - rs->off;
         size_t take = (n - copied) < avail ? (n - copied) : avail;
-        if (out) fwrite(rs->buf + rs->off, 1, take, out);
+        if (outfd >= 0) wr_all(outfd, rs->buf + rs->off, take);
         rs->off += take;
         copied += take;
     }
@@ -340,7 +332,6 @@ static void stream_http_response(tls_t *t, int show_headers) {
     for (;;) {
         int c = rs_getc(&rs);
         if (c < 0) return; /* connection ended before headers completed */
-        if (show_headers) fputc(c, stdout);
         if (hdrlen < sizeof(hdrbuf) - 1) hdrbuf[hdrlen++] = (char)c;
         if ((crlf_run==0 && c=='\r') || (crlf_run==1 && c=='\n') ||
             (crlf_run==2 && c=='\r') || (crlf_run==3 && c=='\n')) {
@@ -350,9 +341,17 @@ static void stream_http_response(tls_t *t, int show_headers) {
         }
     }
     hdrbuf[hdrlen] = '\0';
+    /* Echoed in one write() instead of a fputc() per byte -- both leaner
+       (no buffered-stdio machinery needed) and fewer syscalls. This means
+       -D - only echoes the same (8191-byte-capped) header block that
+       chunked-encoding detection below already works from, rather than an
+       unbounded byte-at-a-time stream; headers past that cap were already
+       invisible to the chunked-detection logic, so nothing that used to
+       work correctly gets any less correct here. */
+    if (show_headers) wr_all(1, hdrbuf, hdrlen);
     int chunked = ci_contains(hdrbuf, "transfer-encoding:") && ci_contains(hdrbuf, "chunked");
     if (!chunked) {
-        while (rs_copy(&rs, stdout, BUFSZ) > 0) { /* keep draining until EOF */ }
+        while (rs_copy(&rs, 1, BUFSZ) > 0) { /* keep draining until EOF */ }
         return;
     }
     for (;;) {
@@ -376,7 +375,7 @@ static void stream_http_response(tls_t *t, int show_headers) {
             }
             return;
         }
-        rs_copy(&rs, stdout, chunklen);
+        rs_copy(&rs, 1, chunklen);
         rs_getc(&rs); rs_getc(&rs); /* each chunk is followed by a mandatory CRLF */
     }
 }
@@ -385,17 +384,20 @@ static void stream_http_response(tls_t *t, int show_headers) {
 typedef struct {
     int show_headers;
     int insecure; /* -k / --insecure: skip the verifier helper entirely, as before */
+    int ai_family; /* -4/-6: force AF_INET/AF_INET6; AF_UNSPEC (default) picks either */
     const char *extra_headers[MAX_EXTRA_HEADERS];
     int n_extra_headers;
     const char *url; /* borrowed pointer into argv */
 } parsed_args_t;
 
-/* Parses -D -, -k/--insecure, and any number of -H 'Header: value' flags, in
-   any order, preceding the URL. Returns 1 with out->url set on success, 0 if
-   no URL token was found (caller should print usage and bail). */
+/* Parses -D -, -k/--insecure, -4/-6, and any number of -H 'Header: value'
+   flags, in any order, preceding the URL. Returns 1 with out->url set on
+   success, 0 if no URL token was found (caller should print usage and
+   bail). */
 static int parse_args(int argc, char **argv, parsed_args_t *out) {
     out->show_headers = 0;
     out->insecure = 0;
+    out->ai_family = AF_UNSPEC;
     out->n_extra_headers = 0;
     int argi = 1;
     while (argi < argc) {
@@ -405,11 +407,20 @@ static int parse_args(int argc, char **argv, parsed_args_t *out) {
         if (strcmp(argv[argi], "-k") == 0 || strcmp(argv[argi], "--insecure") == 0) {
             out->insecure = 1; argi += 1; continue;
         }
+        if (strcmp(argv[argi], "-4") == 0) {
+            out->ai_family = AF_INET; argi += 1; continue;
+        }
+        if (strcmp(argv[argi], "-6") == 0) {
+            out->ai_family = AF_INET6; argi += 1; continue;
+        }
         if (strcmp(argv[argi], "-H") == 0 && argi+1 < argc) {
             if (out->n_extra_headers < MAX_EXTRA_HEADERS)
                 out->extra_headers[out->n_extra_headers++] = argv[argi+1];
             else
-                fprintf(stderr, "warning: more than %d -H headers given, ignoring the rest\n", MAX_EXTRA_HEADERS);
+                /* MAX_EXTRA_HEADERS is stringified at compile time -- no
+                   runtime number-to-string conversion needed here at all. */
+                wrs(2, "warning: more than " NANOCURL_STR(MAX_EXTRA_HEADERS)
+                       " -H headers given, ignoring the rest\n", WR_END);
             argi += 2; continue;
         }
         break; /* first token that isn't a recognized flag is the URL */
@@ -438,20 +449,20 @@ static void parse_url(const char *url, parsed_url_t *out) {
         size_t hplen = (size_t)(slash - url);
         if (hplen >= sizeof hostport) hplen = sizeof(hostport) - 1;
         memcpy(hostport, url, hplen); hostport[hplen] = '\0';
-        snprintf(out->path, sizeof out->path, "%s", slash);
+        scopy(out->path, sizeof out->path, slash);
     } else {
-        snprintf(hostport, sizeof hostport, "%s", url);
-        snprintf(out->path, sizeof out->path, "/");
+        scopy(hostport, sizeof hostport, url);
+        scopy(out->path, sizeof out->path, "/");
     }
-    snprintf(out->port, sizeof out->port, "443");
+    scopy(out->port, sizeof out->port, "443");
     const char *colon = strchr(hostport, ':');
     if (colon) {
         size_t hlen = (size_t)(colon - hostport);
         if (hlen >= sizeof out->host) hlen = sizeof(out->host) - 1;
         memcpy(out->host, hostport, hlen); out->host[hlen] = '\0';
-        snprintf(out->port, sizeof out->port, "%s", colon + 1);
+        scopy(out->port, sizeof out->port, colon + 1);
     } else {
-        snprintf(out->host, sizeof out->host, "%s", hostport);
+        scopy(out->host, sizeof out->host, hostport);
     }
 }
 
@@ -466,17 +477,22 @@ static void parse_url(const char *url, parsed_url_t *out) {
  *   3. abort the connection on failure.
  * ==================================================================== */
 
-static void wr_all(int fd, const void *buf, size_t n) {
+/* Unlike strlite.h's wr_all() (which gives up quietly -- fine for best-
+   effort output like the response body), a short write here means the
+   verifier never got a complete, well-formed request, so this one is loud
+   about it and aborts instead of silently sending a truncated message. */
+static void wr_verify(int fd, const void *buf, size_t n) {
     const u8 *p = buf; size_t off = 0;
     while (off < n) {
         ssize_t w = write(fd, p+off, n-off);
-        if (w <= 0) { fprintf(stderr, "nanocurl: write to verifier failed: %s\n", strerror(errno)); exit(1); }
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) die("nanocurl: write to verifier failed: ", errname(errno), "\n", WR_END);
         off += (size_t)w;
     }
 }
 
-static void wr_u16(int fd, size_t v) { u8 b[2] = {(u8)(v>>8), (u8)v}; wr_all(fd, b, 2); }
-static void wr_u24(int fd, size_t v) { u8 b[3] = {(u8)(v>>16), (u8)(v>>8), (u8)v}; wr_all(fd, b, 3); }
+static void wr_u16(int fd, size_t v) { u8 b[2] = {(u8)(v>>8), (u8)v}; wr_verify(fd, b, 2); }
+static void wr_u24(int fd, size_t v) { u8 b[3] = {(u8)(v>>16), (u8)(v>>8), (u8)v}; wr_verify(fd, b, 3); }
 
 /* Wire format written to the verifier's stdin (all lengths big-endian):
  *   u8      version (1)
@@ -493,43 +509,43 @@ static void wr_u24(int fd, size_t v) { u8 b[3] = {(u8)(v>>16), (u8)(v>>8), (u8)v
  * is inspected; they're copied through untouched for the helper to parse.
  */
 static void send_verify_request(int fd, const handshake_capture_t *cap, const char *host) {
-    if (cap->certverify_msg_len < 4) { fprintf(stderr, "nanocurl: malformed CertificateVerify\n"); exit(1); }
+    if (cap->certverify_msg_len < 4) die("nanocurl: malformed CertificateVerify\n", WR_END);
     const u8 *cv = cap->certverify_msg;
     size_t sigalg = ((size_t)cv[0]<<8)|cv[1];
     size_t siglen = ((size_t)cv[2]<<8)|cv[3];
-    if (4+siglen > cap->certverify_msg_len) { fprintf(stderr, "nanocurl: malformed CertificateVerify\n"); exit(1); }
+    if (4+siglen > cap->certverify_msg_len) die("nanocurl: malformed CertificateVerify\n", WR_END);
     const u8 *sig = cv+4;
 
     const u8 *cm = cap->cert_msg;
     size_t cmlen = cap->cert_msg_len;
-    if (cmlen < 1) { fprintf(stderr, "nanocurl: malformed Certificate message\n"); exit(1); }
+    if (cmlen < 1) die("nanocurl: malformed Certificate message\n", WR_END);
     size_t p = 0;
     u8 ctxlen = cm[p]; p += 1 + ctxlen;
-    if (p+3 > cmlen) { fprintf(stderr, "nanocurl: malformed Certificate message\n"); exit(1); }
+    if (p+3 > cmlen) die("nanocurl: malformed Certificate message\n", WR_END);
     size_t listlen = ((size_t)cm[p]<<16)|((size_t)cm[p+1]<<8)|cm[p+2]; p += 3;
     size_t listend = p + listlen;
-    if (listend > cmlen) { fprintf(stderr, "nanocurl: malformed Certificate message\n"); exit(1); }
+    if (listend > cmlen) die("nanocurl: malformed Certificate message\n", WR_END);
 
     size_t ncerts = 0;
     for (size_t q = p; q < listend; ncerts++) {
-        if (q+3 > listend) { fprintf(stderr, "nanocurl: malformed Certificate message\n"); exit(1); }
+        if (q+3 > listend) die("nanocurl: malformed Certificate message\n", WR_END);
         size_t dl = ((size_t)cm[q]<<16)|((size_t)cm[q+1]<<8)|cm[q+2]; q += 3+dl;
-        if (q+2 > listend) { fprintf(stderr, "nanocurl: malformed Certificate message\n"); exit(1); }
+        if (q+2 > listend) die("nanocurl: malformed Certificate message\n", WR_END);
         size_t el = ((size_t)cm[q]<<8)|cm[q+1]; q += 2+el;
-        if (q > listend) { fprintf(stderr, "nanocurl: malformed Certificate message\n"); exit(1); }
+        if (q > listend) die("nanocurl: malformed Certificate message\n", WR_END);
     }
 
     u8 version = 1;
-    wr_all(fd, &version, 1);
+    wr_verify(fd, &version, 1);
     size_t hlen = strlen(host);
-    wr_u16(fd, hlen); wr_all(fd, host, hlen);
+    wr_u16(fd, hlen); wr_verify(fd, host, hlen);
     wr_u16(fd, sigalg);
-    wr_u16(fd, siglen); wr_all(fd, sig, siglen);
-    wr_all(fd, cap->transcript_before_certverify, 32);
+    wr_u16(fd, siglen); wr_verify(fd, sig, siglen);
+    wr_verify(fd, cap->transcript_before_certverify, 32);
     wr_u16(fd, ncerts);
     for (size_t q = p; q < listend; ) {
         size_t dl = ((size_t)cm[q]<<16)|((size_t)cm[q+1]<<8)|cm[q+2]; q += 3;
-        wr_u24(fd, dl); wr_all(fd, cm+q, dl); q += dl;
+        wr_u24(fd, dl); wr_verify(fd, cm+q, dl); q += dl;
         size_t el = ((size_t)cm[q]<<8)|cm[q+1]; q += 2+el;
     }
 }
@@ -540,26 +556,26 @@ static void send_verify_request(int fd, const handshake_capture_t *cap, const ch
    that's the whole reason it's a fork+exit-code away rather than a linked-in
    function call. Returns 0 (fail closed) if we fail to run the verifier */
 static int verify_certificate(const handshake_capture_t *cap, const char *host) {
-    if (!cap->have_cert) { fprintf(stderr, "nanocurl: server sent no certificate\n"); return 0; }
-    if (!cap->have_certverify) { fprintf(stderr, "nanocurl: server sent no CertificateVerify\n"); return 0; }
+    if (!cap->have_cert) { wrs(2, "nanocurl: server sent no certificate\n", WR_END); return 0; }
+    if (!cap->have_certverify) { wrs(2, "nanocurl: server sent no CertificateVerify\n", WR_END); return 0; }
 
     int pipefd[2];
-    if (pipe(pipefd) != 0) { fprintf(stderr, "nanocurl: pipe: %s\n", strerror(errno)); return 0; }
+    if (pipe(pipefd) != 0) { wrs(2, "nanocurl: pipe: ", errname(errno), "\n", WR_END); return 0; }
     pid_t pid = fork();
-    if (pid < 0) { fprintf(stderr, "nanocurl: fork: %s\n", strerror(errno)); return 0; }
+    if (pid < 0) { wrs(2, "nanocurl: fork: ", errname(errno), "\n", WR_END); return 0; }
     if (pid == 0) {
         dup2(pipefd[0], 0);
         close(pipefd[0]); close(pipefd[1]);
         execlp("nanocurl-verify", "nanocurl-verify", (char *)NULL);
-        fprintf(stderr, "nanocurl: cannot exec nanocurl-verify (is it installed and on $PATH?): %s\n",
-                strerror(errno));
+        wrs(2, "nanocurl: cannot exec nanocurl-verify (is it installed and on $PATH?): ",
+               errname(errno), "\n", WR_END);
         _exit(127);
     }
     close(pipefd[0]);
     send_verify_request(pipefd[1], cap, host);
     close(pipefd[1]);
     int status;
-    if (waitpid(pid, &status, 0) < 0) { fprintf(stderr, "nanocurl: waitpid: %s\n", strerror(errno)); return 0; }
+    if (waitpid(pid, &status, 0) < 0) { wrs(2, "nanocurl: waitpid: ", errname(errno), "\n", WR_END); return 0; }
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
@@ -567,7 +583,8 @@ static int verify_certificate(const handshake_capture_t *cap, const char *host) 
 int main(int argc, char **argv) {
     parsed_args_t args;
     if (!parse_args(argc, argv, &args)) {
-        fprintf(stderr, "usage: %s [-D -] [-k] [-H 'Header: value']... [https://]host[:port][/path]\n", argv[0]);
+        wrs(2, "usage: ", argv[0],
+               " [-D -] [-k] [-4] [-6] [-H 'Header: value']... [https://]host[:port][/path]\n", WR_END);
         return 1;
     }
     parsed_url_t u;
@@ -580,17 +597,18 @@ int main(int argc, char **argv) {
     int n_extra_headers = args.n_extra_headers;
 
     tls_t t = {0};
-    t.fd = tcp_connect(host, port);
+    t.fd = tcp_connect(host, port, args.ai_family);
     sha256_init(&t.transcript);
 
     /* --- keypair --- */
     u8 priv[32], pub[32];
-    FILE *rf = fopen("/dev/urandom", "rb"); fread(priv, 1, 32, rf); fclose(rf);
+    if (getrandom(priv, 32, 0) != 32) die("nanocurl: getrandom failed: ", errname(errno), "\n", WR_END);
     x25519_base(pub, priv);
 
     /* --- build ClientHello --- */
     u8 ch[1024]; size_t n = 0;
-    u8 crandom[32]; rf = fopen("/dev/urandom","rb"); fread(crandom,1,32,rf); fclose(rf);
+    u8 crandom[32];
+    if (getrandom(crandom, 32, 0) != 32) die("nanocurl: getrandom failed: ", errname(errno), "\n", WR_END);
     u8 body[900]; size_t bn = 0;
     body[bn++]=0x03; body[bn++]=0x03; /* legacy_version */
     memcpy(body+bn, crandom, 32); bn += 32; /* random */
@@ -709,7 +727,7 @@ int main(int argc, char **argv) {
     handshake_capture_t cap;
     consume_handshake_to_finished(&t, args.insecure ? NULL : &cap);
     if (!args.insecure && !verify_certificate(&cap, host)) {
-        fprintf(stderr, "nanocurl: aborting (use -k to skip certificate verification)\n");
+        wrs(2, "nanocurl: aborting (use -k to skip certificate verification)\n", WR_END);
         close(t.fd);
         return 1;
     }
@@ -745,16 +763,23 @@ int main(int argc, char **argv) {
     /* --- HTTP/1.1 GET, hand-rolled --- */
     char req[4096];
     size_t rn = 0;
-    rn = buf_append(req, sizeof req, rn, "GET %s HTTP/1.1\r\n", path);
-    if (!has_header(extra_headers, n_extra_headers, "Host"))
-        rn = buf_append(req, sizeof req, rn, "Host: %s\r\n", host);
+    rn = cat(req, sizeof req, rn, "GET ");
+    rn = cat(req, sizeof req, rn, path);
+    rn = cat(req, sizeof req, rn, " HTTP/1.1\r\n");
+    if (!has_header(extra_headers, n_extra_headers, "Host")) {
+        rn = cat(req, sizeof req, rn, "Host: ");
+        rn = cat(req, sizeof req, rn, host);
+        rn = cat(req, sizeof req, rn, "\r\n");
+    }
     if (!has_header(extra_headers, n_extra_headers, "Connection"))
-        rn = buf_append(req, sizeof req, rn, "Connection: close\r\n");
+        rn = cat(req, sizeof req, rn, "Connection: close\r\n");
     if (!has_header(extra_headers, n_extra_headers, "User-Agent"))
-        rn = buf_append(req, sizeof req, rn, "User-Agent: nanocurl/0.0\r\n");
-    for (int i = 0; i < n_extra_headers; i++)
-        rn = buf_append(req, sizeof req, rn, "%s\r\n", extra_headers[i]);
-    rn = buf_append(req, sizeof req, rn, "\r\n");
+        rn = cat(req, sizeof req, rn, "User-Agent: nanocurl/0.0\r\n");
+    for (int i = 0; i < n_extra_headers; i++) {
+        rn = cat(req, sizeof req, rn, extra_headers[i]);
+        rn = cat(req, sizeof req, rn, "\r\n");
+    }
+    rn = cat(req, sizeof req, rn, "\r\n");
     write_record(&t, 23, (u8*)req, rn, 1);
 
     stream_http_response(&t, show_headers);
