@@ -1,9 +1,10 @@
 #!/bin/sh
 # Regenerates the RSA test fixtures used by test_rsa.c: a keypair, a message,
-# and real OpenSSL-produced PKCS#1 v1.5 and PSS signatures over it. Committed
-# under tests/rsa/ so the test suite doesn't need OpenSSL or network to run.
+# and real OpenSSL-produced PKCS#1 v1.5 and PSS signatures over it. Written
+# to build/rsa/, which `make test` (re)generates automatically and which is
+# never committed. Requires OpenSSL.
 set -e
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/../build"
 mkdir -p rsa
 openssl genrsa -out rsa/key.pem 2048 2>/dev/null
 openssl rsa -in rsa/key.pem -pubout -outform der -out rsa/pub.der 2>/dev/null

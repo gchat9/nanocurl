@@ -2,10 +2,13 @@
 # Regenerates the chain-of-trust test fixtures used by test_chain.c: a small
 # root -> intermediate -> leaf hierarchy (deliberately mixing RSA and EC
 # keys/signatures so both hand-rolled signature paths get exercised), plus
-# tampered variants for the negative test cases. Committed under
-# tests/chain_fixtures/ so the test suite doesn't need OpenSSL to run.
+# tampered variants for the negative test cases. Written to
+# build/chain_fixtures/, which `make test` (re)generates automatically and
+# which is never committed. Requires OpenSSL and python3.
 set -e
-cd "$(dirname "$0")/chain_fixtures"
+cd "$(dirname "$0")/../build"
+mkdir -p chain_fixtures
+cd chain_fixtures
 
 cat > /tmp/nanocurl_test_openssl.cnf << 'EOF'
 [req]

@@ -70,24 +70,24 @@ static void test_bignum_core(void) {
 
 static void test_rsa(void) {
     printf("RSA signature verification (real OpenSSL-produced signatures):\n");
-    size_t pklen; u8 *pkder = read_file("rsa/pub.der", &pklen);
+    size_t pklen; u8 *pkder = read_file("../build/rsa/pub.der", &pklen);
     bn_t n, e;
     CHECK(parse_rsa_public_key_from_spki_der(pkder, pklen, &n, &e), "parse RSA public key from SPKI DER");
     printf("       (modulus is %d bits)\n", bn_bitlen(&n));
     free(pkder);
 
-    size_t msglen; u8 *msg = read_file("rsa/message.txt", &msglen);
+    size_t msglen; u8 *msg = read_file("../build/rsa/message.txt", &msglen);
     u8 hash[32]; sha256_oneshot(msg, msglen, hash);
     free(msg);
     u8 badhash[32]; memcpy(badhash, hash, 32); badhash[0] ^= 0x01;
 
-    size_t siglen; u8 *sig = read_file("rsa/sig_pkcs1.bin", &siglen);
+    size_t siglen; u8 *sig = read_file("../build/rsa/sig_pkcs1.bin", &siglen);
     CHECK(rsa_pkcs1_verify(&n, &e, sig, siglen, hash), "PKCS#1 v1.5 signature verifies against the correct hash");
     CHECK(!rsa_pkcs1_verify(&n, &e, sig, siglen, badhash), "PKCS#1 v1.5 rejects a tampered hash");
     CHECK(!rsa_pkcs1_verify(&n, &e, sig, siglen - 1, hash), "PKCS#1 v1.5 rejects a truncated signature");
     free(sig);
 
-    size_t sigplen; u8 *sigp = read_file("rsa/sig_pss.bin", &sigplen);
+    size_t sigplen; u8 *sigp = read_file("../build/rsa/sig_pss.bin", &sigplen);
     CHECK(rsa_pss_verify(&n, &e, sigp, sigplen, hash), "RSA-PSS signature verifies against the correct hash");
     CHECK(!rsa_pss_verify(&n, &e, sigp, sigplen, badhash), "RSA-PSS rejects a tampered hash");
     u8 tampered_sig[512]; memcpy(tampered_sig, sigp, sigplen); tampered_sig[10] ^= 0x01;
@@ -95,7 +95,7 @@ static void test_rsa(void) {
     free(sigp);
 
     /* cross-checks: a PSS signature must not verify as PKCS#1 v1.5 and vice versa */
-    sig = read_file("rsa/sig_pkcs1.bin", &siglen);
+    sig = read_file("../build/rsa/sig_pkcs1.bin", &siglen);
     CHECK(!rsa_pss_verify(&n, &e, sig, siglen, hash), "a PKCS#1 v1.5 signature is correctly NOT a valid PSS signature");
     free(sig);
 }

@@ -20,7 +20,11 @@ if ldd /tmp/nanocurl-verify-release | grep -qi crypto; then
 fi
 echo "  ok, libc only"
 
-REQ=tests/wire_fixtures_untrusted_root.bin
+REQ=build/wire_fixtures_untrusted_root.bin
+if [ ! -f "$REQ" ]; then
+    tests/gen_chain_fixtures.sh
+    tests/gen_wire_fixtures.sh
+fi
 echo "running both builds against the same request (real signed chain, untrusted root)..."
 rc_release=0; /tmp/nanocurl-verify-release < "$REQ" > /tmp/out_release.txt 2>&1 || rc_release=$?
 rc_audit=0; /tmp/nanocurl-verify-audit < "$REQ" > /tmp/out_audit.txt 2>&1 || rc_audit=$?

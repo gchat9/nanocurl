@@ -2,3 +2,7 @@
 *.d
 build/*
 nanocurl
+nanocurl-verify
+tests/test_verify
+tests/test_rsa
+tests/test_ecdsa

@@ -47,7 +47,7 @@ static void test_b64_and_pem(void) {
     n = b64_decode("not!valid", 9, out, sizeof out);
     CHECK(n < 0, "b64_decode rejects invalid characters");
 
-    size_t rootlen; u8 *root = read_file("chain_fixtures/root.der", &rootlen);
+    size_t rootlen; u8 *root = read_file("../build/chain_fixtures/root.der", &rootlen);
     char pem[4096];
     int plen = snprintf(pem, sizeof pem, "junk before\n-----BEGIN CERTIFICATE-----\n");
     /* base64-encode root for a round-trip PEM parse test */
@@ -80,7 +80,7 @@ static void test_b64_and_pem(void) {
 static trust_store_t g_store;
 
 static void load_fixture_store(void) {
-    static const char *paths[] = { "chain_fixtures/trust_store.pem", NULL };
+    static const char *paths[] = { "../build/chain_fixtures/trust_store.pem", NULL };
     if (!load_trust_store_from_paths(&g_store, paths)) {
         fprintf(stderr, "could not load chain_fixtures/trust_store.pem\n");
         exit(2);
@@ -99,20 +99,20 @@ static void test_chain_building(void) {
     printf("chain-of-trust verification (local root -> intermediate -> leaf fixture):\n");
     char reason[160];
 
-    { const char *files[] = { "chain_fixtures/leaf.der", "chain_fixtures/inter.der" };
+    { const char *files[] = { "../build/chain_fixtures/leaf.der", "../build/chain_fixtures/inter.der" };
       int r = verify_chain_files(files, 2, reason, sizeof reason);
       if (r != 1) printf("       (reason: %s)\n", reason);
       CHECK(r == 1, "valid leaf+intermediate chains to the trusted root (RSA root, EC intermediate, RSA leaf)"); }
 
-    { const char *files[] = { "chain_fixtures/leaf_badsig.der", "chain_fixtures/inter.der" };
+    { const char *files[] = { "../build/chain_fixtures/leaf_badsig.der", "../build/chain_fixtures/inter.der" };
       int r = verify_chain_files(files, 2, reason, sizeof reason);
       CHECK(r == 0, "chain with a corrupted leaf signature is rejected"); }
 
-    { const char *files[] = { "chain_fixtures/leaf_expired.der", "chain_fixtures/inter.der" };
+    { const char *files[] = { "../build/chain_fixtures/leaf_expired.der", "../build/chain_fixtures/inter.der" };
       int r = verify_chain_files(files, 2, reason, sizeof reason);
       CHECK(r == 0, "chain with an expired leaf is rejected regardless of valid signatures"); }
 
-    { const char *files[] = { "chain_fixtures/leaf.der" }; /* no intermediate sent at all */
+    { const char *files[] = { "../build/chain_fixtures/leaf.der" }; /* no intermediate sent at all */
       int r = verify_chain_files(files, 1, reason, sizeof reason);
       CHECK(r == 0, "leaf alone, without the intermediate, does not chain to anything in the store"); }
 
@@ -132,14 +132,14 @@ static void test_chain_building(void) {
          accepting it a hop earlier than this test originally expected is
          the fix working as intended, not a false accept, so the fixture
          pairing moved to leaf.der to keep testing the intended property.) */
-      const char *files[] = { "chain_fixtures/leaf.der", "chain_fixtures/leaf.der" };
+      const char *files[] = { "../build/chain_fixtures/leaf.der", "../build/chain_fixtures/leaf.der" };
       int r = verify_chain_files(files, 2, reason, sizeof reason);
       CHECK(r <= 0, "a certificate presented as its own issuer (wrong link) is never accepted as trusted"); }
 
     { /* the exact shape that surfaced the original gap: a P-256 leaf signed
          by a P-384 intermediate using ecdsa-with-SHA384 -- see
          nanocurl-verify.c's SHA-384/P-384 additions */
-      const char *files[] = { "chain_fixtures/leaf384.der", "chain_fixtures/inter384.der" };
+      const char *files[] = { "../build/chain_fixtures/leaf384.der", "../build/chain_fixtures/inter384.der" };
       int r = verify_chain_files(files, 2, reason, sizeof reason);
       if (r != 1) printf("       (reason: %s)\n", reason);
       CHECK(r == 1, "P-256 leaf under a P-384/ecdsa-with-SHA384 intermediate chains correctly"); }
@@ -152,7 +152,7 @@ static void test_chain_building(void) {
 static void test_cross_signed_root(void) {
     printf("cross-signed root (trust a root directly even when the server sends a cross-signed copy of it):\n");
     trust_store_t store;
-    static const char *paths[] = { "chain_fixtures/crossroot_trust_store.pem", NULL };
+    static const char *paths[] = { "../build/chain_fixtures/crossroot_trust_store.pem", NULL };
     if (!load_trust_store_from_paths(&store, paths)) {
         fprintf(stderr, "could not load chain_fixtures/crossroot_trust_store.pem\n");
         exit(2);
@@ -169,7 +169,7 @@ static void test_cross_signed_root(void) {
          curl's cacert.pem, reproduced here with a throwaway local CA
          hierarchy instead of live internet certificates). */
       const u8 *certs[3]; size_t lens[3]; u8 *bufs[3];
-      const char *files[] = { "chain_fixtures/crossleaf.der", "chain_fixtures/crossinter.der", "chain_fixtures/crossroot_new_crosssigned.der" };
+      const char *files[] = { "../build/chain_fixtures/crossleaf.der", "../build/chain_fixtures/crossinter.der", "../build/chain_fixtures/crossroot_new_crosssigned.der" };
       for (int i = 0; i < 3; i++) bufs[i] = read_file(files[i], &lens[i]), certs[i] = bufs[i];
       int r = handrolled_verify_chain_with_store(certs, lens, 3, &store, reason, sizeof reason);
       for (int i = 0; i < 3; i++) free(bufs[i]);
@@ -182,12 +182,14 @@ static void test_cross_signed_root(void) {
          identically, since the intermediate's issuer is the same modern
          root either way. */
       const u8 *certs[2]; size_t lens[2]; u8 *bufs[2];
-      const char *files[] = { "chain_fixtures/crossleaf.der", "chain_fixtures/crossinter.der" };
+      const char *files[] = { "../build/chain_fixtures/crossleaf.der", "../build/chain_fixtures/crossinter.der" };
       for (int i = 0; i < 2; i++) bufs[i] = read_file(files[i], &lens[i]), certs[i] = bufs[i];
       int r = handrolled_verify_chain_with_store(certs, lens, 2, &store, reason, sizeof reason);
       for (int i = 0; i < 2; i++) free(bufs[i]);
       if (r != 1) printf("       (reason: %s)\n", reason);
       CHECK(r == 1, "the same chain verifies without the server sending the redundant cross-signed root at all"); }
+
+    free_trust_store(&store);
 }
 
 int main(void) {
@@ -197,6 +199,7 @@ int main(void) {
     CHECK(g_store.count == 1, "fixture trust store contains exactly our one test root");
     test_chain_building();
     test_cross_signed_root();
+    free_trust_store(&g_store);
     printf("\n%s (%d failure%s)\n", failures ? "SOME TESTS FAILED" : "all tests passed",
            failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;

@@ -57,15 +57,15 @@ int main(void) {
     test_hostname_matches();
 
     printf("handrolled_check_leaf (real DER fixtures in certs/):\n");
-    test_cert("certs/exact_san.der",     "test-a.example",     1, "exact SAN dNSName match");
-    test_cert("certs/exact_san.der",     "not-test-a.example", 0, "SAN present, no entry matches -> reject");
-    test_cert("certs/wildcard_san.der",  "www.test-b.example", 1, "wildcard SAN matches a subdomain");
-    test_cert("certs/wildcard_san.der",  "test-b.example",     0, "wildcard SAN does not match the bare apex");
-    test_cert("certs/san_no_match.der",  "test-c.example",     0, "SAN present but non-matching -- CN must NOT be used as fallback (this is the exact shape of bug we found against google.com)");
-    test_cert("certs/cn_only.der",       "test-d.example",     1, "CN fallback used when there is no SAN extension at all");
-    test_cert("certs/cn_only.der",       "other.example",      0, "CN fallback correctly rejects the wrong host");
-    test_cert("certs/expired.der",       "test-e.example",     0, "expired certificate rejected regardless of hostname match");
-    test_cert("certs/not_yet_valid.der", "test-f.example",     0, "not-yet-valid certificate rejected regardless of hostname match");
+    test_cert("../build/certs/exact_san.der",     "test-a.example",     1, "exact SAN dNSName match");
+    test_cert("../build/certs/exact_san.der",     "not-test-a.example", 0, "SAN present, no entry matches -> reject");
+    test_cert("../build/certs/wildcard_san.der",  "www.test-b.example", 1, "wildcard SAN matches a subdomain");
+    test_cert("../build/certs/wildcard_san.der",  "test-b.example",     0, "wildcard SAN does not match the bare apex");
+    test_cert("../build/certs/san_no_match.der",  "test-c.example",     0, "SAN present but non-matching -- CN must NOT be used as fallback (this is the exact shape of bug we found against google.com)");
+    test_cert("../build/certs/cn_only.der",       "test-d.example",     1, "CN fallback used when there is no SAN extension at all");
+    test_cert("../build/certs/cn_only.der",       "other.example",      0, "CN fallback correctly rejects the wrong host");
+    test_cert("../build/certs/expired.der",       "test-e.example",     0, "expired certificate rejected regardless of hostname match");
+    test_cert("../build/certs/not_yet_valid.der", "test-f.example",     0, "not-yet-valid certificate rejected regardless of hostname match");
 
     printf("\n%s (%d failure%s)\n", failures ? "SOME TESTS FAILED" : "all tests passed",
            failures, failures == 1 ? "" : "s");

@@ -1,8 +1,10 @@
 #!/bin/sh
-# Regenerates the deterministic certificate fixtures used by test_verify.c.
-# Not run automatically by the test suite -- the resulting DER files are
-# committed under tests/certs/ so tests don't need OpenSSL or network access
-# to run. Re-run this manually if you need to add/change a fixture.
+# Regenerates the deterministic certificate fixtures used by test_verify.c,
+# into build/certs/. Run automatically by `make test` (see the Makefile) --
+# nothing under build/ is committed, so these are always freshly generated
+# rather than kept in sync by hand. Requires OpenSSL and python3; re-run
+# manually (./tests/gen_certs.sh) if you want fresh fixtures without a full
+# `make test`.
 #
 # Dates are patched directly into the DER's fixed-width UTCTime fields after
 # generation (this OpenSSL build has no -not_before/-not_after in `req`).
@@ -10,7 +12,7 @@
 # are only ever fed to handrolled_check_leaf(), which never touches the
 # signature -- only structure, SAN/CN, and validity dates.
 set -e
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/../build"
 mkdir -p certs
 
 patch_dates() {

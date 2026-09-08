@@ -167,8 +167,8 @@ int main(void) {
 
     test_curve_properties("P-256", &p256);
     test_curve_properties("P-384", &p384);
-    test_known_answer_256("ecdsa_fixtures/pub.der", "ecdsa_fixtures/message.txt", "ecdsa_fixtures/sig.der");
-    test_known_answer_384("ecdsa_fixtures/pub384.der", "ecdsa_fixtures/message384.txt", "ecdsa_fixtures/sig384.der");
+    test_known_answer_256("../build/ecdsa_fixtures/pub.der", "../build/ecdsa_fixtures/message.txt", "../build/ecdsa_fixtures/sig.der");
+    test_known_answer_384("../build/ecdsa_fixtures/pub384.der", "../build/ecdsa_fixtures/message384.txt", "../build/ecdsa_fixtures/sig384.der");
 
     printf("\n%s (%d failure%s)\n", failures ? "SOME TESTS FAILED" : "all tests passed",
            failures, failures == 1 ? "" : "s");

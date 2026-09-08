@@ -1,12 +1,15 @@
 #!/bin/sh
-# Regenerates the wire-protocol fixture(s) used by run_audit_build.sh: a
+# Regenerates the wire-protocol fixture used by run_audit_build.sh: a
 # synthetic nanocurl-verify request built from the real signed chain in
-# chain_fixtures/ (leaf+intermediate, real DER, real signatures) whose root
-# is deliberately not in the *system* trust store -- both the release and
-# audit builds must reject it, and for the same chain-of-trust reason, even
-# though every signature inside the chain is genuinely valid.
+# build/chain_fixtures/ (leaf+intermediate, real DER, real signatures) whose
+# root is deliberately not in the *system* trust store -- both the release
+# and audit builds must reject it, and for the same chain-of-trust reason,
+# even though every signature inside the chain is genuinely valid. Written
+# to build/wire_fixtures_untrusted_root.bin; requires build/chain_fixtures/
+# to already exist (run gen_chain_fixtures.sh first -- `make test` handles
+# the ordering automatically). Never committed.
 set -e
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/../build"
 python3 - << 'EOF'
 import struct
 def build(host, sigalg, sig, th, certs):

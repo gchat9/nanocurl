@@ -536,6 +536,15 @@ typedef struct {
 typedef struct {
     trust_anchor_t anchors[MAX_TRUST_ANCHORS];
     int count;
+    u8 *txt_buf; /* raw file contents backing the anchors above; see the
+                    "deliberately never freed" comment on
+                    load_trust_store_from_paths() below -- these fields
+                    exist so that callers who *do* want to free them (e.g.
+                    the test suite, which loads many short-lived stores in
+                    one process and is run under LeakSanitizer) can, via
+                    free_trust_store(). Production's one-shot call site
+                    still doesn't bother. */
+    u8 *der_buf;
 } trust_store_t;
 
 static const char *TRUST_STORE_CANDIDATE_PATHS[] = {
@@ -547,13 +556,18 @@ static const char *TRUST_STORE_CANDIDATE_PATHS[] = {
 
 /* Loads and parses a CA bundle from the first path in `paths` (NULL-
    terminated) that exists. The backing buffers for the decoded certificate
-   bytes are allocated here and deliberately never freed -- trust_anchor_t
-   entries point directly into them, they need to live for the process's
-   entire (one-shot, short) lifetime, and the OS reclaims them at exit
-   anyway. Returns 1 on success (at least one certificate loaded), and
-   0 otherwise (fail) */
+   bytes are allocated here and stashed on `store` (see txt_buf/der_buf).
+   Production's call site (handrolled_verify_chain) never frees them:
+   trust_anchor_t entries point directly into them, they need to live for
+   the process's entire (one-shot, short) lifetime, and the OS reclaims
+   them at exit anyway. Callers that load more than one store in a single
+   process -- namely the test suite -- should call free_trust_store() once
+   they're done with a given store. Returns 1 on success (at least one
+   certificate loaded), and 0 otherwise (fail) */
 static int load_trust_store_from_paths(trust_store_t *store, const char *const *paths) {
     store->count = 0;
+    store->txt_buf = NULL;
+    store->der_buf = NULL;
     int fd = -1;
     for (int i = 0; paths[i]; i++) { fd = open(paths[i], O_RDONLY); if (fd >= 0) break; }
     if (fd < 0) return 0;
@@ -571,9 +585,11 @@ static int load_trust_store_from_paths(trust_store_t *store, const char *const *
         }
     }
     close(fd);
-    if (!txt || n == 0) return 0;
+    if (!txt || n == 0) { free(txt); return 0; }
     u8 *der = malloc((size_t)fsize); /* decoded output is always <= input size */
-    if (!der) return 0;
+    if (!der) { free(txt); return 0; }
+    store->txt_buf = txt;
+    store->der_buf = der;
 
     const char *p = (const char *)txt, *end = p + n;
     size_t der_off = 0;
@@ -595,6 +611,17 @@ static int load_trust_store_from_paths(trust_store_t *store, const char *const *
 
 static int load_trust_store(trust_store_t *store) {
     return load_trust_store_from_paths(store, TRUST_STORE_CANDIDATE_PATHS);
+}
+
+/* Releases the backing buffers allocated by load_trust_store_from_paths().
+   Not called from production's one-shot call site (see the comment there)
+   -- this exists for callers such as the test suite that load multiple
+   stores in one process and want LeakSanitizer-clean runs. Safe to call on
+   a store that failed to load (fields are NULL-initialized in that case). */
+static void free_trust_store(trust_store_t *store) {
+    free(store->txt_buf); store->txt_buf = NULL;
+    free(store->der_buf); store->der_buf = NULL;
+    store->count = 0;
 }
 
 static const trust_anchor_t *find_trust_anchor_by_subject(const trust_store_t *store,

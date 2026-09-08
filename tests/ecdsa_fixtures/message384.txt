@@ -1,1 +1,0 @@
-ecdsa p384 test message, deterministic fixture for nanocurl-verify

@@ -1,10 +1,13 @@
 #!/bin/sh
 # Builds and runs the nanocurl-verify unit tests. Exits nonzero on any
-# failure. Fixtures under certs/ and rsa/ are pre-generated and committed --
-# only re-run gen_certs.sh / gen_rsa_fixtures.sh yourself if you're adding or
-# changing a fixture.
+# failure. Fixtures are generated fresh into build/ (nothing under build/ is
+# committed) -- see gen_certs.sh / gen_rsa_fixtures.sh / gen_ecdsa_fixtures.sh
+# for what each one produces. Requires OpenSSL and python3.
 set -e
 cd "$(dirname "$0")"
+./gen_certs.sh
+./gen_rsa_fixtures.sh
+./gen_ecdsa_fixtures.sh
 gcc -O0 -g -Wall -Wextra -Wno-unused-function -o test_verify test_verify.c -lssl -lcrypto
 gcc -O0 -g -Wall -Wextra -Wno-unused-function -o test_rsa test_rsa.c -lssl -lcrypto
 gcc -O0 -g -Wall -Wextra -Wno-unused-function -o test_ecdsa test_ecdsa.c -lssl -lcrypto
